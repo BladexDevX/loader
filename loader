@@ -1,0 +1,522 @@
+local IconLoader = {}
+
+local HttpService = game:GetService("HttpService")
+
+local BASE_URL = "https://raw.githubusercontent.com/BladexDevX/Icons/refs/heads/main/"
+local ROOT_DIR = "Bladex/"
+local CACHE_DIR = ROOT_DIR .. "assets/"
+local USED_FILE = CACHE_DIR .. "used_icons.json"
+
+local PACKAGES = {
+    gravity   = { path = "Iconos/gravity.lua", type = "icon" },
+    lucide    = { path = "Iconos/lucide.lua", type = "icon" },
+    sfsymbols = { path = "Iconos/sfsymbols.lua", type = "icon" },
+    solar     = { path = "Iconos/solar.lua", type = "icon" },
+    darkdex   = { path = "Iconos/darkdex-Icons.lua", type = "icon" },
+
+    craft     = { path = "Iconos/craft.lua", type = "sprite" },
+    geist     = { path = "Iconos/geist.lua", type = "sprite" },
+
+    sounds    = { path = "Audio/darkdex_ui_sounds.lua.txt", type = "audio" },
+}
+
+local LOWER_TO_KEY = {}
+
+for key in pairs(PACKAGES) do
+    LOWER_TO_KEY[key:lower()] = key
+end
+
+local HTTP_TIMEOUT = 15
+local MAX_ATTEMPTS = 2
+local PACKAGE_CACHE_TTL = 24 * 3600
+
+local packageCache = {}
+local packageLoaded = {}
+local packageLoading = {}
+local lastError = {}
+local usedCache = nil
+
+local function reportError(context, message)
+    warn(("[BladexIconLoader] %s: %s"):format(
+        tostring(context),
+        tostring(message)
+    ))
+end
+
+local function resolvePackageName(name)
+    if type(name) ~= "string" then
+        return nil
+    end
+
+    return LOWER_TO_KEY[name:lower()]
+end
+
+local function keyFor(pack, iconName)
+    return pack .. "::" .. tostring(iconName)
+end
+
+local function ensureFolders()
+    pcall(function()
+        if not isfolder(ROOT_DIR) then
+            makefolder(ROOT_DIR)
+        end
+
+        if not isfolder(CACHE_DIR) then
+            makefolder(CACHE_DIR)
+        end
+    end)
+end
+
+ensureFolders()
+
+local function loadUsedCacheFromDisk()
+    if usedCache ~= nil then
+        return usedCache
+    end
+
+    usedCache = {}
+
+    pcall(function()
+        if not isfile(USED_FILE) then
+            return
+        end
+
+        local decoded = HttpService:JSONDecode(readfile(USED_FILE))
+
+        if type(decoded) == "table" then
+            usedCache = decoded
+        end
+    end)
+
+    return usedCache
+end
+
+local function saveUsedCacheToDisk()
+    pcall(function()
+        writefile(
+            USED_FILE,
+            HttpService:JSONEncode(usedCache or {})
+        )
+    end)
+end
+
+local function rememberUsedResource(pack, name, value)
+    loadUsedCacheFromDisk()
+
+    local key = keyFor(pack, name)
+
+    if usedCache[key] ~= value then
+        usedCache[key] = value
+        saveUsedCacheToDisk()
+    end
+end
+
+local function packageCacheFilePath(pack)
+    return CACHE_DIR .. "pkg_" .. pack .. ".json"
+end
+
+local function savePackageToDisk(pack, data)
+    pcall(function()
+        writefile(
+            packageCacheFilePath(pack),
+            HttpService:JSONEncode({
+                timestamp = os.time(),
+                data = data,
+            })
+        )
+    end)
+end
+
+local function loadPackageFromDisk(pack)
+    local result
+
+    pcall(function()
+        local path = packageCacheFilePath(pack)
+
+        if not isfile(path) then
+            return
+        end
+
+        local decoded = HttpService:JSONDecode(readfile(path))
+
+        if type(decoded) ~= "table" then
+            return
+        end
+
+        if type(decoded.timestamp) ~= "number" then
+            return
+        end
+
+        if type(decoded.data) ~= "table" then
+            return
+        end
+
+        if os.time() - decoded.timestamp > PACKAGE_CACHE_TTL then
+            return
+        end
+
+        result = decoded.data
+    end)
+
+    return result
+end
+
+local function httpGetWithTimeout(url, timeoutSec)
+    timeoutSec = timeoutSec or HTTP_TIMEOUT
+
+    local finished = false
+    local success = false
+    local response = nil
+
+    task.spawn(function()
+        success, response = pcall(function()
+            return game:HttpGet(url)
+        end)
+
+        finished = true
+    end)
+
+    local elapsed = 0
+    local step = 0.1
+
+    while not finished and elapsed < timeoutSec do
+        task.wait(step)
+        elapsed += step
+    end
+
+    if not finished then
+        return false, "timeout"
+    end
+
+    if not success then
+        return false, response
+    end
+
+    if type(response) ~= "string" or response == "" then
+        return false, "empty response"
+    end
+
+    return true, response
+end
+
+local function safeHttpGet(url)
+    local lastErr
+
+    for attempt = 1, MAX_ATTEMPTS do
+        local ok, result = httpGetWithTimeout(url, HTTP_TIMEOUT)
+
+        if ok then
+            return true, result
+        end
+
+        lastErr = result
+
+        if attempt < MAX_ATTEMPTS then
+            task.wait(attempt)
+        end
+    end
+
+    return false, lastErr
+end
+
+local function classifyError(errText)
+    errText = tostring(errText or ""):lower()
+
+    if errText:find("404", 1, true) then
+        return "NOT_FOUND (404): archivo no encontrado."
+    end
+
+    if errText:find("403", 1, true) then
+        return "403: acceso bloqueado temporalmente."
+    end
+
+    if errText:find("429", 1, true) then
+        return "429: demasiadas peticiones."
+    end
+
+    if errText:find("timeout", 1, true) or errText:find("timed out", 1, true) then
+        return "TIMEOUT: el servidor no respondió a tiempo."
+    end
+
+    if errText == "" then
+        return "Respuesta vacía."
+    end
+
+    return "Error: " .. errText
+end
+
+local function executePackage(pack)
+    local cfg = PACKAGES[pack]
+
+    if not cfg then
+        return nil, "Paquete no definido: " .. tostring(pack)
+    end
+
+    local url = BASE_URL .. cfg.path
+    local ok, content = safeHttpGet(url)
+
+    if not ok then
+        return nil, classifyError(content)
+    end
+
+    local compiled, compileError = loadstring(content)
+
+    if not compiled then
+        return nil, "El paquete no compila: " .. tostring(compileError)
+    end
+
+    local executed, raw = pcall(compiled)
+
+    if not executed then
+        return nil, "El paquete produjo un error al ejecutarse: " .. tostring(raw)
+    end
+
+    if type(raw) ~= "table" then
+        return nil, "El paquete no devolvió una tabla."
+    end
+
+    if cfg.type == "sprite" then
+        if type(raw.Spritesheets) ~= "table" then
+            return nil, "Falta la tabla 'Spritesheets'."
+        end
+
+        if type(raw.Icons) ~= "table" then
+            return nil, "Falta la tabla 'Icons'."
+        end
+
+        return {
+            spritesheets = raw.Spritesheets,
+            icons = raw.Icons,
+        }
+    end
+
+    return raw
+end
+
+local function loadPackageInternal(pack, forceRefresh)
+    if not forceRefresh and packageLoaded[pack] then
+        return packageCache[pack]
+    end
+
+    if packageLoading[pack] then
+        return nil
+    end
+
+    packageLoading[pack] = true
+
+    local result
+    local err
+
+    if not forceRefresh then
+        result = loadPackageFromDisk(pack)
+    end
+
+    if not result then
+        result, err = executePackage(pack)
+
+        if result then
+            savePackageToDisk(pack, result)
+        end
+    end
+
+    packageLoading[pack] = nil
+
+    if not result then
+        lastError[pack] = err or "Fallo desconocido."
+        reportError(pack, lastError[pack])
+        return nil
+    end
+
+    packageCache[pack] = result
+    packageLoaded[pack] = true
+    lastError[pack] = nil
+
+    return result
+end
+
+function IconLoader.LoadPackage(name, forceRefresh)
+    local pack = resolvePackageName(name)
+
+    if not pack then
+        local valid = {}
+
+        for key in pairs(PACKAGES) do
+            valid[#valid + 1] = key
+        end
+
+        table.sort(valid)
+
+        local message = "Paquete desconocido: '" ..
+            tostring(name) ..
+            "'. Válidos: " ..
+            table.concat(valid, ", ")
+
+        lastError[tostring(name)] = message
+        reportError(name, message)
+
+        return nil
+    end
+
+    return loadPackageInternal(pack, forceRefresh == true)
+end
+
+function IconLoader.Get(packName, iconName)
+    local pack = resolvePackageName(packName)
+
+    if not pack or type(iconName) ~= "string" then
+        return nil
+    end
+
+    loadUsedCacheFromDisk()
+
+    local cached = usedCache[keyFor(pack, iconName)]
+
+    if cached ~= nil then
+        return cached
+    end
+
+    local data = IconLoader.LoadPackage(pack)
+
+    if not data then
+        return nil
+    end
+
+    local result
+    local cfg = PACKAGES[pack]
+
+    if cfg.type == "sprite" then
+        result = data.icons[iconName]
+    else
+        result = data[iconName]
+    end
+
+    if result ~= nil then
+        rememberUsedResource(pack, iconName, result)
+        return result
+    end
+
+    reportError(
+        iconName,
+        ("El recurso '%s' no existe en '%s'."):format(
+            iconName,
+            pack
+        )
+    )
+
+    return nil
+end
+
+function IconLoader.GetAny(packNames, iconName)
+    if type(packNames) ~= "table" then
+        return nil
+    end
+
+    for _, packName in ipairs(packNames) do
+        local result = IconLoader.Get(packName, iconName)
+
+        if result ~= nil then
+            return result, resolvePackageName(packName)
+        end
+    end
+
+    return nil
+end
+
+function IconLoader.GetSound(name)
+    return IconLoader.Get("sounds", name)
+end
+
+function IconLoader.Refresh(packName)
+    local pack = resolvePackageName(packName)
+
+    if not pack then
+        return nil
+    end
+
+    packageCache[pack] = nil
+    packageLoaded[pack] = nil
+
+    local path = packageCacheFilePath(pack)
+
+    pcall(function()
+        if isfile(path) then
+            delfile(path)
+        end
+    end)
+
+    return IconLoader.LoadPackage(pack, true)
+end
+
+function IconLoader.Diagnose(packName)
+    local pack = resolvePackageName(packName) or packName
+    return lastError[pack]
+end
+
+function IconLoader.ListPackages()
+    local names = {}
+
+    for key in pairs(PACKAGES) do
+        names[#names + 1] = key
+    end
+
+    table.sort(names)
+
+    return names
+end
+
+function IconLoader.ListUsedIcons()
+    loadUsedCacheFromDisk()
+
+    local copy = {}
+
+    for key, value in pairs(usedCache) do
+        copy[key] = value
+    end
+
+    return copy
+end
+
+function IconLoader.ClearUsedCache()
+    usedCache = {}
+
+    pcall(function()
+        if isfile(USED_FILE) then
+            delfile(USED_FILE)
+        end
+    end)
+end
+
+function IconLoader.ClearPackageCache(packName)
+    local pack = resolvePackageName(packName)
+
+    if not pack then
+        return false
+    end
+
+    packageCache[pack] = nil
+    packageLoaded[pack] = nil
+    lastError[pack] = nil
+
+    pcall(function()
+        local path = packageCacheFilePath(pack)
+
+        if isfile(path) then
+            delfile(path)
+        end
+    end)
+
+    return true
+end
+
+function IconLoader.ClearAllPackageCaches()
+    for pack in pairs(PACKAGES) do
+        IconLoader.ClearPackageCache(pack)
+    end
+end
+
+function IconLoader.IsLoaded(packName)
+    local pack = resolvePackageName(packName)
+    return pack ~= nil and packageLoaded[pack] == true
+end
+
+return IconLoader
