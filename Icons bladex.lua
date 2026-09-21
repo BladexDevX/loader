@@ -1,0 +1,7 @@
+return {
+	["house"] = "rbxassetid://140623380548188",
+	["square-terminal"] = "rbxassetid://93160857701002",
+	["gamepad-2"] = "rbxassetid://132321352749915",
+	["settings"] = "rbxassetid://122648469541413",
+	["bladex-hud-logo"] = "rbxassetid://125064196202041"
+}
