@@ -1,44 +1,24 @@
 --[[
-INSTRUCCIONES PARA IA:
-
-Este script es un cargador de iconos para Roblox. Descarga packs de iconos
-desde un repositorio GitHub y los devuelve como rbxassetid:// para usar en
-ImageLabels.
-
-CÓMO CARGARLO:
-    local IL = loadstring(game:HttpGet(
-        "https://raw.githubusercontent.com/BladexDevX/loader/refs/heads/main/loader"
-    ))()
-    IL.Ready(15)
-
-CÓMO OBTENER UN ICONO:
-    IL.Get("lucide", "check")     -- pack específico
-    IL.Find("check")              -- busca en todos los packs
-    IL.MakeIcon("check", 20, btn) -- crea ImageLabel ya configurado
-
-PACKS: lucide, solar, gravity, fluent, material, sfsymbols, craft, geist
-
-FUNCIONES PRINCIPALES:
-    Get(pack, name) | Find(name) | GetAny({packs}, name)
-    MakeIcon(name, size, parent) | List() | Packs() | Search(query)
-    Ready(timeout) | Refresh(pack) | Spec() | Help()
-
-USO TÍPICO EN UI:
-    local icon = IL.MakeIcon("send", 18, miBoton)
-    icon.Position = UDim2.new(0, 8, 0.5, -9)
-    icon.ImageColor3 = Color3.fromRGB(255, 255, 255)
+IA - INSTRUCCION RAPIDA
+Usa este loader para los iconos de la UI.
+Declara solamente los nombres que necesitas en ICONS.
+No escribas rbxassetid:// y no indiques el pack si no es necesario.
+El loader busca automaticamente cada icono y guarda solo los iconos utilizados.
+Ejemplo:
+local ICONS = {"search", "settings", "x"}
+local icons = IL.Load(ICONS)
+local icon = icons.search
+VERSION: 1.0
 --]]
 
+-- Servicios y configuracion basica
 local HttpService = game:GetService("HttpService")
 
--- repositorio remoto de packs de iconos
 local BASE_URL = "https://raw.githubusercontent.com/BladexDevX/loader/refs/heads/main/"
--- carpeta local donde se cachean los packs
 local CACHE_DIR = "Bladex/assets/"
--- tiempo de vida del cache: 24 horas
 local CACHE_TTL = 86400
 
--- packs disponibles (cada uno es un archivo Lua en el repo)
+-- Packs disponibles. La UI no necesita elegir uno cuando usa Load/Find.
 local PACKAGES = {
     gravity   = { path = "Icons/gravity.lua",   type = "icon" },
     lucide    = { path = "Icons/lucide.lua",    type = "icon" },
@@ -50,312 +30,629 @@ local PACKAGES = {
     material  = { path = "Icons/material.lua",  type = "icon" },
 }
 
--- estado interno del loader
+-- Orden usado para buscar un icono por nombre.
+local SEARCH_ORDER = {
+    "lucide",
+    "solar",
+    "gravity",
+    "fluent",
+    "material",
+    "sfsymbols",
+    "craft",
+    "geist",
+}
+
+-- Estado del loader y cache de iconos utilizados.
 local IconLoader = {
-    version  = "3.0.0",
-    loaded   = {},
-    loading  = {},
-    errors   = {},
-    ready    = false,
+    version = "4.0.0",
+    loaded = {},
+    loadedIcons = {},
+    loading = {},
+    errors = {},
+    ready = false,
     _waiters = {},
 }
 
--- utils
-local function fileExists(p) return type(isfile) == "function" and isfile(p) end
-local function dirExists(p) return type(isfolder) == "function" and isfolder(p) end
-local function canWrite() return type(writefile) == "function" and type(readfile) == "function" end
+local function fileExists(p)
+    return type(isfile) == "function" and isfile(p)
+end
 
--- crea una carpeta (y sus padres) si no existe
+local function dirExists(p)
+    return type(isfolder) == "function" and isfolder(p)
+end
+
+local function canWrite()
+    return type(writefile) == "function" and type(readfile) == "function"
+end
+
 local function ensureDir(dir)
-    if not canWrite() then return false end
-    if not dirExists(dir) then
-        local parts = {}
-        for seg in dir:gmatch("[^/]+") do parts[#parts+1] = seg end
-        local cur = ""
-        for _, seg in ipairs(parts) do
-            cur = cur == "" and seg or (cur .. "/" .. seg)
-            if not dirExists(cur) then
-                local ok = pcall(makefolder, cur)
-                if not ok then return false end
+    if not canWrite() or type(makefolder) ~= "function" then
+        return false
+    end
+
+    if dirExists(dir) then
+        return true
+    end
+
+    local parts = {}
+    for seg in dir:gmatch("[^/]+") do
+        parts[#parts + 1] = seg
+    end
+
+    local cur = ""
+    for _, seg in ipairs(parts) do
+        cur = cur == "" and seg or cur .. "/" .. seg
+        if not dirExists(cur) then
+            local ok = pcall(makefolder, cur)
+            if not ok and not dirExists(cur) then
+                return false
             end
         end
     end
+
     return dirExists(dir)
 end
 
--- imprime un log con prefijo [IconLoader]
 local function log(level, msg, ...)
     local text = select("#", ...) > 0 and string.format(msg, ...) or msg
     local line = string.format("[IconLoader][%s] %s", level, text)
-    if level == "ERROR" and warn then warn(line)
-    elseif print then print(line) end
+
+    if level == "ERROR" and type(warn) == "function" then
+        warn(line)
+    elseif type(print) == "function" then
+        print(line)
+    end
 end
 
--- clasifica un error de descarga en una categoría legible
 local function classifyError(err)
     local e = tostring(err or ""):lower()
-    if e:find("404") then return "NOT_FOUND" end
-    if e:find("403") then return "FORBIDDEN" end
-    if e:find("429") then return "RATE_LIMIT" end
-    if e:find("timeout") then return "TIMEOUT" end
-    if e:find("invalid") then return "INVALID" end
+
+    if e:find("404", 1, true) then return "NOT_FOUND" end
+    if e:find("403", 1, true) then return "FORBIDDEN" end
+    if e:find("429", 1, true) then return "RATE_LIMIT" end
+    if e:find("timeout", 1, true) then return "TIMEOUT" end
+    if e:find("invalid", 1, true) then return "INVALID" end
     if e == "" then return "EMPTY" end
+
     return "UNKNOWN"
 end
 
-local function nowSec() return os.time() end
-
--- cache
-local function cachePath(pack) return CACHE_DIR .. "pkg_" .. pack .. ".json" end
-
--- lee el pack desde el cache si existe y no ha expirado
-local function readCache(pack)
-    if not canWrite() then return nil end
-    local p = cachePath(pack)
-    if not fileExists(p) then return nil end
-    local ok, raw = pcall(readfile, p)
-    if not ok or not raw or raw == "" then return nil end
-    local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
-    if not ok2 or type(data) ~= "table" then return nil end
-    if nowSec() - (tonumber(data.__timestamp) or 0) > CACHE_TTL then return nil end
-    return data.payload
+local function nowSec()
+    return os.time()
 end
 
--- guarda un pack en el cache local con timestamp
-local function writeCache(pack, payload)
-    if not canWrite() then return false end
-    ensureDir(CACHE_DIR)
-    return pcall(function()
-        writefile(cachePath(pack), HttpService:JSONEncode({
+local function normalizeKey(value)
+    return tostring(value or ""):lower():gsub("[%s_%-]", "")
+end
+
+local function safeFileName(value)
+    return tostring(value or ""):gsub("[^%w_%-]", "_")
+end
+
+local function iconCachePath(name)
+    return CACHE_DIR .. "icon_" .. safeFileName(normalizeKey(name)) .. ".json"
+end
+
+local function packTempPath(pack)
+    return CACHE_DIR .. "temp_" .. safeFileName(pack) .. ".json"
+end
+
+-- Lee un icono individual guardado en cache.
+local function readIconCache(name)
+    if not canWrite() then
+        return nil
+    end
+
+    local path = iconCachePath(name)
+    if not fileExists(path) then
+        return nil
+    end
+
+    local ok, raw = pcall(readfile, path)
+    if not ok or type(raw) ~= "string" or raw == "" then
+        return nil
+    end
+
+    local ok2, data = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+
+    if not ok2 or type(data) ~= "table" then
+        return nil
+    end
+
+    if nowSec() - (tonumber(data.__timestamp) or 0) > CACHE_TTL then
+        if type(delfile) == "function" then
+            pcall(delfile, path)
+        end
+        return nil
+    end
+
+    if type(data.name) ~= "string" or type(data.id) ~= "string" then
+        return nil
+    end
+
+    return data
+end
+
+-- Guarda solamente el icono encontrado, no todo el pack.
+local function writeIconCache(name, id, pack)
+    if not canWrite() then
+        return false
+    end
+
+    if not ensureDir(CACHE_DIR) then
+        return false
+    end
+
+    local path = iconCachePath(name)
+
+    local ok = pcall(function()
+        writefile(path, HttpService:JSONEncode({
             __timestamp = nowSec(),
-            payload = payload,
+            name = name,
+            id = id,
+            pack = pack,
         }))
     end)
+
+    return ok
 end
 
--- carga
--- descarga un pack desde el repositorio o lo toma del cache
-local function fetchPack(name)
-    local def = PACKAGES[name]
-    if not def then
-        log("ERROR", "Pack no existe: %s", tostring(name))
-        return nil
+local function deleteTempPack(pack)
+    local path = packTempPath(pack)
+
+    if fileExists(path) and type(delfile) == "function" then
+        pcall(delfile, path)
+    end
+end
+
+-- Toma del pack solo los nombres solicitados.
+local function extractRequestedIcons(pack, data, requested)
+    if type(data) ~= "table" or type(requested) ~= "table" then
+        return 0
     end
 
-    local cached = readCache(name)
-    if cached then
-        log("INFO", "Pack '%s' desde cache", name)
-        return cached
+    local found = 0
+
+    for requestedName in pairs(requested) do
+        local target = normalizeKey(requestedName)
+        local id = nil
+        local realName = requestedName
+
+        if data[requestedName] then
+            id = data[requestedName]
+        elseif data[target] then
+            id = data[target]
+            realName = target
+        else
+            for key, value in pairs(data) do
+                if normalizeKey(key) == target then
+                    id = value
+                    realName = key
+                    break
+                end
+            end
+        end
+
+        if type(id) == "string" and id ~= "" then
+            IconLoader.loadedIcons[target] = {
+                name = realName,
+                id = id,
+                pack = pack,
+            }
+
+            writeIconCache(target, id, pack)
+            found = found + 1
+        end
     end
 
-    local ok, raw = pcall(function() return game:HttpGet(BASE_URL .. def.path) end)
-    if not ok or type(raw) ~= "string" or #raw < 10 then
-        IconLoader.errors[name] = classifyError(raw)
-        log("ERROR", "Fallo descargando '%s': %s", name, IconLoader.errors[name])
-        return nil
+    return found
+end
+
+-- Descarga un pack solo cuando hace falta buscar un icono.
+local function loadPackForRequests(pack, requested)
+    if type(PACKAGES[pack]) ~= "table" then
+        IconLoader.errors[pack] = "NOT_FOUND"
+        return false
+    end
+
+    if type(requested) ~= "table" or next(requested) == nil then
+        return false
+    end
+
+    local ok, raw = pcall(function()
+        return game:HttpGet(BASE_URL .. PACKAGES[pack].path)
+    end)
+
+    if not ok or type(raw) ~= "string" or #raw < 2 then
+        IconLoader.errors[pack] = classifyError(raw)
+        log("ERROR", "Fallo descargando '%s': %s", pack, IconLoader.errors[pack])
+        return false
     end
 
     local ok2, result = pcall(function()
         local fn = loadstring(raw)
-        if not fn then error("loadstring devolvio nil") end
+        if type(fn) ~= "function" then
+            error("loadstring devolvio nil")
+        end
         return fn()
     end)
 
     if not ok2 or type(result) ~= "table" then
-        IconLoader.errors[name] = classifyError(result)
-        log("ERROR", "Pack '%s' invalido: %s", name, IconLoader.errors[name])
-        return nil
+        IconLoader.errors[pack] = classifyError(result)
+        log("ERROR", "Pack '%s' invalido: %s", pack, IconLoader.errors[pack])
+        return false
     end
 
-    writeCache(name, result)
-    log("INFO", "Pack '%s' cargado", name)
+    local found = extractRequestedIcons(pack, result, requested)
+
+    result = nil
+    raw = nil
+
+    deleteTempPack(pack)
+
+    IconLoader.loaded[pack] = true
+
+    log("INFO", "Pack '%s': %d iconos solicitados encontrados", pack, found)
+
+    return found > 0
+end
+
+-- Carga solo los nombres indicados por la UI.
+local function loadRequestedIcons(names)
+    local requested = {}
+
+    if type(names) == "string" then
+        requested[normalizeKey(names)] = names
+    elseif type(names) == "table" then
+        for _, name in ipairs(names) do
+            if type(name) == "string" and name ~= "" then
+                requested[normalizeKey(name)] = name
+            end
+        end
+    end
+
+    if next(requested) == nil then
+        return {}
+    end
+
+    local remaining = {}
+
+    for normalized, original in pairs(requested) do
+        local cached = readIconCache(normalized)
+
+        if cached then
+            IconLoader.loadedIcons[normalized] = {
+                name = cached.name or original,
+                id = cached.id,
+                pack = cached.pack,
+            }
+        else
+            remaining[normalized] = original
+        end
+    end
+
+    for _, pack in ipairs(SEARCH_ORDER) do
+        if next(remaining) == nil then
+            break
+        end
+
+        loadPackForRequests(pack, remaining)
+
+        for normalized in pairs(remaining) do
+            if IconLoader.loadedIcons[normalized] then
+                remaining[normalized] = nil
+            end
+        end
+    end
+
+    for normalized, original in pairs(remaining) do
+        IconLoader.errors[normalized] = "ICON_NOT_FOUND"
+        log("WARN", "Icono '%s' no encontrado", tostring(original))
+    end
+
+    local result = {}
+
+    for normalized, original in pairs(requested) do
+        local item = IconLoader.loadedIcons[normalized]
+
+        if item then
+            result[original] = item.id
+        end
+    end
+
     return result
 end
 
--- asegura que un pack esté en memoria (lo carga si hace falta)
-local function ensurePack(name)
-    if IconLoader.loaded[name] then return IconLoader.loaded[name] end
-    if IconLoader.loading[name] then
-        local t = 0
-        while IconLoader.loading[name] and t < 10 do
-            task.wait(0.1) t = t + 0.1
-        end
-        return IconLoader.loaded[name]
-    end
-    IconLoader.loading[name] = true
-    local data = fetchPack(name)
-    IconLoader.loading[name] = nil
-    if data then IconLoader.loaded[name] = data end
-    return data
+-- Uso principal: IL.Load({"search", "settings", "x"})
+function IconLoader.Load(names)
+    return loadRequestedIcons(names)
 end
 
--- normaliza nombres: quita espacios, guiones y baja a minúsculas
-local function normalizeKey(k)
-    return tostring(k or ""):lower():gsub("[%s_%-]", "")
-end
-
--- busca un icono dentro de un pack ya cargado
-local function findInPack(pack, name)
-    local data = IconLoader.loaded[pack]
-    if not data then return nil end
-    local target = normalizeKey(name)
-    if data[name] then return data[name] end
-    if data[target] then return data[target] end
-    for k, v in pairs(data) do
-        if normalizeKey(k) == target then return v end
-    end
-    return nil
-end
-
--- api
--- Get(pack, name) — obtiene un icono específico de un pack
+-- Obtiene un icono indicando el pack directamente.
 function IconLoader.Get(pack, name)
-    if type(pack) ~= "string" or type(name) ~= "string" then return nil end
-    ensurePack(pack)
-    return findInPack(pack, name)
+    if type(pack) ~= "string" or type(name) ~= "string" then
+        return nil
+    end
+
+    local normalized = normalizeKey(name)
+    local cached = IconLoader.loadedIcons[normalized]
+
+    if cached and (pack == "" or cached.pack == pack) then
+        return cached.id
+    end
+
+    local requested = {
+        [normalized] = name,
+    }
+
+    loadPackForRequests(pack, requested)
+
+    local item = IconLoader.loadedIcons[normalized]
+
+    if item and item.pack == pack then
+        return item.id
+    end
+
+    return nil
 end
 
--- Find(name) — busca un icono en TODOS los packs
+-- Busca automaticamente el icono por nombre.
 function IconLoader.Find(name)
-    for pack in pairs(IconLoader.loaded) do
-        local id = findInPack(pack, name)
-        if id then return id end
+    if type(name) ~= "string" then
+        return nil
     end
-    for _, pack in ipairs({"lucide", "solar", "gravity", "fluent", "material"}) do
-        local id = IconLoader.Get(pack, name)
-        if id then return id end
+
+    local normalized = normalizeKey(name)
+    local cached = IconLoader.loadedIcons[normalized]
+
+    if cached then
+        return cached.id
     end
-    return nil
+
+    local result = loadRequestedIcons({name})
+    return result[name]
 end
 
--- GetAny({packs}, name) — prueba varios packs en orden
+-- Busca el icono solo en los packs indicados.
 function IconLoader.GetAny(list, name)
-    if type(list) ~= "table" then return nil end
-    for _, pack in ipairs(list) do
-        local id = IconLoader.Get(pack, name)
-        if id then return id end
+    if type(list) ~= "table" or type(name) ~= "string" then
+        return nil
     end
+
+    local normalized = normalizeKey(name)
+    local cached = IconLoader.loadedIcons[normalized]
+
+    if cached then
+        for _, pack in ipairs(list) do
+            if cached.pack == pack then
+                return cached.id
+            end
+        end
+    end
+
+    local requested = {
+        [normalized] = name,
+    }
+
+    for _, pack in ipairs(list) do
+        if type(pack) == "string" and PACKAGES[pack] then
+            loadPackForRequests(pack, requested)
+
+            local item = IconLoader.loadedIcons[normalized]
+            if item and item.pack == pack then
+                return item.id
+            end
+        end
+    end
+
     return nil
 end
 
--- List() — devuelve la lista de packs disponibles
 function IconLoader.List()
     local out = {}
-    for name in pairs(PACKAGES) do out[#out+1] = name end
+
+    for name in pairs(PACKAGES) do
+        out[#out + 1] = name
+    end
+
     table.sort(out)
     return out
 end
 
--- Packs() — devuelve metadata de cada pack
 function IconLoader.Packs()
     local out = {}
+
     for name, def in pairs(PACKAGES) do
         out[name] = {
             type = def.type,
             path = def.path,
-            loaded = IconLoader.loaded[name] ~= nil,
+            loaded = IconLoader.loaded[name] == true,
             error = IconLoader.errors[name],
         }
     end
+
     return out
 end
 
--- Search(query) — busca iconos por nombre en packs cargados
 function IconLoader.Search(query)
     local q = normalizeKey(query)
-    if q == "" then return {} end
+
+    if q == "" then
+        return {}
+    end
+
     local out = {}
-    for pack, data in pairs(IconLoader.loaded) do
-        for name, id in pairs(data) do
-            if normalizeKey(name):find(q, 1, true) then
-                out[#out+1] = { pack=pack, name=name, id=id }
-            end
+
+    for normalized, item in pairs(IconLoader.loadedIcons) do
+        if normalized:find(q, 1, true) then
+            out[#out + 1] = {
+                pack = item.pack,
+                name = item.name,
+                id = item.id,
+            }
         end
     end
+
+    table.sort(out, function(a, b)
+        return tostring(a.name) < tostring(b.name)
+    end)
+
     return out
 end
 
--- Help() — texto de ayuda rápida
 function IconLoader.Help()
     return ([[
 IconLoader v%s
 
-Get(pack, name) | Find(name) | GetAny({packs}, name)
-List() | Packs() | Search(query) | Help() | Spec()
-Ready(timeout) | Refresh(pack) | MakeIcon(name, size, parent) | Errors()
+Load({"search", "settings", "copy", "x"})
+Get(pack, name)
+Find(name)
+GetAny({"lucide", "solar"}, name)
+List()
+Packs()
+Search(query)
+Help()
+Spec()
+Ready(timeout)
+Refresh(pack)
+MakeIcon(name, size, parent)
+Errors()
 
+Los iconos se solicitan solo por nombre.
+El loader busca automaticamente el pack.
+Solo se guarda en cache el icono utilizado.
 Packs: %s
-]]):format(IconLoader.version, table.concat(IconLoader.List(), ", "))
+]]):format(
+        IconLoader.version,
+        table.concat(IconLoader.List(), ", ")
+    )
 end
 
--- Spec() — descripción máquina-legible de la API
 function IconLoader.Spec()
     return {
         name = "IconLoader",
         version = IconLoader.version,
         packages = (function()
             local p = {}
+
             for name, def in pairs(PACKAGES) do
-                p[name] = { path = def.path, type = def.type }
+                p[name] = {
+                    path = def.path,
+                    type = def.type,
+                }
             end
+
             return p
         end)(),
         functions = {
+            Load     = { params = {"names: table|string"}, returns = "table" },
             Get      = { params = {"pack: string", "name: string"}, returns = "string|nil" },
-            Find     = { params = {"name: string"},                 returns = "string|nil" },
-            GetAny   = { params = {"list: table", "name: string"},  returns = "string|nil" },
-            List     = { params = {},                               returns = "table" },
-            Packs    = { params = {},                               returns = "table" },
-            Search   = { params = {"query: string"},                returns = "table" },
-            Help     = { params = {},                               returns = "string" },
-            Spec     = { params = {},                               returns = "table" },
-            Ready    = { params = {"timeout: number?"},             returns = "bool" },
-            Refresh  = { params = {"pack: string"},                 returns = "bool" },
-            MakeIcon = { params = {"name", "size?", "parent?"},     returns = "ImageLabel" },
-            Errors   = { params = {},                               returns = "table" },
+            Find     = { params = {"name: string"}, returns = "string|nil" },
+            GetAny   = { params = {"list: table", "name: string"}, returns = "string|nil" },
+            List     = { params = {}, returns = "table" },
+            Packs    = { params = {}, returns = "table" },
+            Search   = { params = {"query: string"}, returns = "table" },
+            Help     = { params = {}, returns = "string" },
+            Spec     = { params = {}, returns = "table" },
+            Ready    = { params = {"names: table|string"}, returns = "bool" },
+            Refresh  = { params = {"pack: string"}, returns = "bool" },
+            MakeIcon = { params = {"name", "size?", "parent?"}, returns = "ImageLabel" },
+            Errors   = { params = {}, returns = "table" },
         },
     }
 end
 
--- Ready(timeout) — espera a que los packs prioritarios estén cargados
-function IconLoader.Ready(timeout)
-    if IconLoader.ready then return true end
-    timeout = timeout or 15
-    local priority = {"lucide", "solar", "gravity"}
-    local done = 0
-
-    task.spawn(function()
-        for _, pack in ipairs(priority) do
-            pcall(ensurePack, pack)
-            done = done + 1
-        end
-    end)
-
-    local t = 0
-    while done < #priority and t < timeout do
-        task.wait(0.1) t = t + 0.1
+function IconLoader.Ready(names, timeout)
+    if type(names) == "number" then
+        timeout = names
+        names = nil
     end
 
-    IconLoader.ready = true
-    for _, cb in ipairs(IconLoader._waiters) do pcall(cb) end
+    timeout = timeout or 15
+
+    if names == nil then
+        IconLoader.ready = true
+
+        for _, cb in ipairs(IconLoader._waiters) do
+            pcall(cb, true)
+        end
+
+        IconLoader._waiters = {}
+        return true
+    end
+
+    local done = false
+    local result = {}
+
+    task.spawn(function()
+        result = loadRequestedIcons(names)
+        done = true
+    end)
+
+    local started = os.clock()
+
+    while not done and os.clock() - started < timeout do
+        task.wait()
+    end
+
+    IconLoader.ready = done
+
+    for _, cb in ipairs(IconLoader._waiters) do
+        pcall(cb, done)
+    end
+
     IconLoader._waiters = {}
-    return done == #priority
+
+    return done
 end
 
--- Refresh(pack) — borra el cache de un pack y lo vuelve a descargar
 function IconLoader.Refresh(pack)
-    if not PACKAGES[pack] then return false end
-    local p = cachePath(pack)
-    if fileExists(p) and type(delfile) == "function" then pcall(delfile, p) end
+    if not PACKAGES[pack] then
+        return false
+    end
+
     IconLoader.loaded[pack] = nil
     IconLoader.errors[pack] = nil
-    return ensurePack(pack) ~= nil
+
+    local prefix = CACHE_DIR .. "icon_"
+
+    if canWrite() and type(listfiles) == "function" then
+        local ok, files = pcall(listfiles, CACHE_DIR)
+
+        if ok and type(files) == "table" and type(delfile) == "function" then
+            for _, path in ipairs(files) do
+                local base = tostring(path):match("([^/]+)$") or ""
+
+                if base:sub(1, #prefix - #CACHE_DIR) == "" then
+                    local normalized = base:match("^icon_(.+)%.json$")
+
+                    if normalized then
+                        local cached = readIconCache(normalized)
+
+                        if cached and cached.pack == pack then
+                            pcall(delfile, path)
+                            IconLoader.loadedIcons[normalized] = nil
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return true
 end
 
--- MakeIcon(name, size, parent) — crea un ImageLabel listo para usar
+-- Crea un ImageLabel usando el icono por nombre.
 function IconLoader.MakeIcon(name, size, parent)
-    size = size or 24
-    local id = IconLoader.Find(name) or "rbxasset://textures/ui/GuiImagePlaceholder.png"
+    size = tonumber(size) or 24
+
+    local id = IconLoader.Find(name)
+
+    if not id then
+        id = "rbxasset://textures/ui/GuiImagePlaceholder.png"
+    end
 
     local img = Instance.new("ImageLabel")
     img.Name = "Icon_" .. tostring(name)
@@ -364,37 +661,44 @@ function IconLoader.MakeIcon(name, size, parent)
     img.BackgroundTransparency = 1
     img.ScaleType = Enum.ScaleType.Fit
     img.ImageColor3 = Color3.fromRGB(255, 255, 255)
-    if parent then img.Parent = parent end
+
+    if parent then
+        img.Parent = parent
+    end
 
     task.spawn(function()
-        local t = 0
-        while not img.IsLoaded and t < 5 do task.wait(0.1) t = t + 0.1 end
+        local started = os.clock()
+
+        while not img.IsLoaded and os.clock() - started < 5 do
+            task.wait(0.1)
+        end
+
         if not img.IsLoaded then
             img.Image = "rbxasset://textures/ui/GuiImagePlaceholder.png"
-            log("WARN", "Icono '%s' no cargó", tostring(name))
+            log("WARN", "Icono '%s' no cargo", tostring(name))
         end
     end)
 
     return img
 end
 
--- Errors() — devuelve los errores por pack
-function IconLoader.Errors() return IconLoader.errors end
-
--- OnReady(callback) — ejecuta callback cuando el loader esté listo
-function IconLoader.OnReady(callback)
-    if IconLoader.ready then pcall(callback)
-    else IconLoader._waiters[#IconLoader._waiters + 1] = callback end
+function IconLoader.Errors()
+    return IconLoader.errors
 end
 
--- init
-log("INFO", "IconLoader v%s inicializando...", IconLoader.version)
+function IconLoader.OnReady(callback)
+    if type(callback) ~= "function" then
+        return
+    end
 
-task.spawn(function()
-    pcall(function() IconLoader.Ready(15) end)
-    local n = 0
-    for _ in pairs(IconLoader.loaded) do n = n + 1 end
-    log("INFO", "IconLoader listo. Packs: %d", n)
-end)
+    if IconLoader.ready then
+        pcall(callback, true)
+    else
+        IconLoader._waiters[#IconLoader._waiters + 1] = callback
+    end
+end
+
+-- El loader no carga packs automaticamente al iniciar.
+log("INFO", "IconLoader v%s inicializado. Carga selectiva activada.", IconLoader.version)
 
 return IconLoader
