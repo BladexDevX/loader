@@ -1,522 +1,400 @@
-local IconLoader = {}
+--[[
+INSTRUCCIONES PARA IA:
+
+Este script es un cargador de iconos para Roblox. Descarga packs de iconos
+desde un repositorio GitHub y los devuelve como rbxassetid:// para usar en
+ImageLabels.
+
+CÓMO CARGARLO:
+    local IL = loadstring(game:HttpGet(
+        "https://raw.githubusercontent.com/BladexDevX/loader/refs/heads/main/loader"
+    ))()
+    IL.Ready(15)
+
+CÓMO OBTENER UN ICONO:
+    IL.Get("lucide", "check")     -- pack específico
+    IL.Find("check")              -- busca en todos los packs
+    IL.MakeIcon("check", 20, btn) -- crea ImageLabel ya configurado
+
+PACKS: lucide, solar, gravity, fluent, material, sfsymbols, craft, geist
+
+FUNCIONES PRINCIPALES:
+    Get(pack, name) | Find(name) | GetAny({packs}, name)
+    MakeIcon(name, size, parent) | List() | Packs() | Search(query)
+    Ready(timeout) | Refresh(pack) | Spec() | Help()
+
+USO TÍPICO EN UI:
+    local icon = IL.MakeIcon("send", 18, miBoton)
+    icon.Position = UDim2.new(0, 8, 0.5, -9)
+    icon.ImageColor3 = Color3.fromRGB(255, 255, 255)
+--]]
 
 local HttpService = game:GetService("HttpService")
 
-local BASE_URL = "https://raw.githubusercontent.com/BladexDevX/Icons/refs/heads/main/"
-local ROOT_DIR = "Bladex/"
-local CACHE_DIR = ROOT_DIR .. "assets/"
-local USED_FILE = CACHE_DIR .. "used_icons.json"
+-- repositorio remoto de packs de iconos
+local BASE_URL = "https://raw.githubusercontent.com/BladexDevX/loader/refs/heads/main/"
+-- carpeta local donde se cachean los packs
+local CACHE_DIR = "Bladex/assets/"
+-- tiempo de vida del cache: 24 horas
+local CACHE_TTL = 86400
 
+-- packs disponibles (cada uno es un archivo Lua en el repo)
 local PACKAGES = {
-    gravity   = { path = "Iconos/gravity.lua", type = "icon" },
-    lucide    = { path = "Iconos/lucide.lua", type = "icon" },
-    sfsymbols = { path = "Iconos/sfsymbols.lua", type = "icon" },
-    solar     = { path = "Iconos/solar.lua", type = "icon" },
-    darkdex   = { path = "Iconos/darkdex-Icons.lua", type = "icon" },
-
-    craft     = { path = "Iconos/craft.lua", type = "sprite" },
-    geist     = { path = "Iconos/geist.lua", type = "sprite" },
-
-    sounds    = { path = "Audio/darkdex_ui_sounds.lua.txt", type = "audio" },
+    gravity   = { path = "Icons/gravity.lua",   type = "icon" },
+    lucide    = { path = "Icons/lucide.lua",    type = "icon" },
+    sfsymbols = { path = "Icons/sfsymbols.lua", type = "icon" },
+    solar     = { path = "Icons/solar.lua",     type = "icon" },
+    craft     = { path = "Icons/craft.lua",     type = "icon" },
+    geist     = { path = "Icons/geist.lua",     type = "icon" },
+    fluent    = { path = "Icons/fluent.lua",    type = "icon" },
+    material  = { path = "Icons/material.lua",  type = "icon" },
 }
 
-local LOWER_TO_KEY = {}
+-- estado interno del loader
+local IconLoader = {
+    version  = "3.0.0",
+    loaded   = {},
+    loading  = {},
+    errors   = {},
+    ready    = false,
+    _waiters = {},
+}
 
-for key in pairs(PACKAGES) do
-    LOWER_TO_KEY[key:lower()] = key
+-- utils
+local function fileExists(p) return type(isfile) == "function" and isfile(p) end
+local function dirExists(p) return type(isfolder) == "function" and isfolder(p) end
+local function canWrite() return type(writefile) == "function" and type(readfile) == "function" end
+
+-- crea una carpeta (y sus padres) si no existe
+local function ensureDir(dir)
+    if not canWrite() then return false end
+    if not dirExists(dir) then
+        local parts = {}
+        for seg in dir:gmatch("[^/]+") do parts[#parts+1] = seg end
+        local cur = ""
+        for _, seg in ipairs(parts) do
+            cur = cur == "" and seg or (cur .. "/" .. seg)
+            if not dirExists(cur) then
+                local ok = pcall(makefolder, cur)
+                if not ok then return false end
+            end
+        end
+    end
+    return dirExists(dir)
 end
 
-local HTTP_TIMEOUT = 15
-local MAX_ATTEMPTS = 2
-local PACKAGE_CACHE_TTL = 24 * 3600
-
-local packageCache = {}
-local packageLoaded = {}
-local packageLoading = {}
-local lastError = {}
-local usedCache = nil
-
-local function reportError(context, message)
-    warn(("[BladexIconLoader] %s: %s"):format(
-        tostring(context),
-        tostring(message)
-    ))
+-- imprime un log con prefijo [IconLoader]
+local function log(level, msg, ...)
+    local text = select("#", ...) > 0 and string.format(msg, ...) or msg
+    local line = string.format("[IconLoader][%s] %s", level, text)
+    if level == "ERROR" and warn then warn(line)
+    elseif print then print(line) end
 end
 
-local function resolvePackageName(name)
-    if type(name) ~= "string" then
+-- clasifica un error de descarga en una categoría legible
+local function classifyError(err)
+    local e = tostring(err or ""):lower()
+    if e:find("404") then return "NOT_FOUND" end
+    if e:find("403") then return "FORBIDDEN" end
+    if e:find("429") then return "RATE_LIMIT" end
+    if e:find("timeout") then return "TIMEOUT" end
+    if e:find("invalid") then return "INVALID" end
+    if e == "" then return "EMPTY" end
+    return "UNKNOWN"
+end
+
+local function nowSec() return os.time() end
+
+-- cache
+local function cachePath(pack) return CACHE_DIR .. "pkg_" .. pack .. ".json" end
+
+-- lee el pack desde el cache si existe y no ha expirado
+local function readCache(pack)
+    if not canWrite() then return nil end
+    local p = cachePath(pack)
+    if not fileExists(p) then return nil end
+    local ok, raw = pcall(readfile, p)
+    if not ok or not raw or raw == "" then return nil end
+    local ok2, data = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok2 or type(data) ~= "table" then return nil end
+    if nowSec() - (tonumber(data.__timestamp) or 0) > CACHE_TTL then return nil end
+    return data.payload
+end
+
+-- guarda un pack en el cache local con timestamp
+local function writeCache(pack, payload)
+    if not canWrite() then return false end
+    ensureDir(CACHE_DIR)
+    return pcall(function()
+        writefile(cachePath(pack), HttpService:JSONEncode({
+            __timestamp = nowSec(),
+            payload = payload,
+        }))
+    end)
+end
+
+-- carga
+-- descarga un pack desde el repositorio o lo toma del cache
+local function fetchPack(name)
+    local def = PACKAGES[name]
+    if not def then
+        log("ERROR", "Pack no existe: %s", tostring(name))
         return nil
     end
 
-    return LOWER_TO_KEY[name:lower()]
-end
-
-local function keyFor(pack, iconName)
-    return pack .. "::" .. tostring(iconName)
-end
-
-local function ensureFolders()
-    pcall(function()
-        if not isfolder(ROOT_DIR) then
-            makefolder(ROOT_DIR)
-        end
-
-        if not isfolder(CACHE_DIR) then
-            makefolder(CACHE_DIR)
-        end
-    end)
-end
-
-ensureFolders()
-
-local function loadUsedCacheFromDisk()
-    if usedCache ~= nil then
-        return usedCache
-    end
-
-    usedCache = {}
-
-    pcall(function()
-        if not isfile(USED_FILE) then
-            return
-        end
-
-        local decoded = HttpService:JSONDecode(readfile(USED_FILE))
-
-        if type(decoded) == "table" then
-            usedCache = decoded
-        end
-    end)
-
-    return usedCache
-end
-
-local function saveUsedCacheToDisk()
-    pcall(function()
-        writefile(
-            USED_FILE,
-            HttpService:JSONEncode(usedCache or {})
-        )
-    end)
-end
-
-local function rememberUsedResource(pack, name, value)
-    loadUsedCacheFromDisk()
-
-    local key = keyFor(pack, name)
-
-    if usedCache[key] ~= value then
-        usedCache[key] = value
-        saveUsedCacheToDisk()
-    end
-end
-
-local function packageCacheFilePath(pack)
-    return CACHE_DIR .. "pkg_" .. pack .. ".json"
-end
-
-local function savePackageToDisk(pack, data)
-    pcall(function()
-        writefile(
-            packageCacheFilePath(pack),
-            HttpService:JSONEncode({
-                timestamp = os.time(),
-                data = data,
-            })
-        )
-    end)
-end
-
-local function loadPackageFromDisk(pack)
-    local result
-
-    pcall(function()
-        local path = packageCacheFilePath(pack)
-
-        if not isfile(path) then
-            return
-        end
-
-        local decoded = HttpService:JSONDecode(readfile(path))
-
-        if type(decoded) ~= "table" then
-            return
-        end
-
-        if type(decoded.timestamp) ~= "number" then
-            return
-        end
-
-        if type(decoded.data) ~= "table" then
-            return
-        end
-
-        if os.time() - decoded.timestamp > PACKAGE_CACHE_TTL then
-            return
-        end
-
-        result = decoded.data
-    end)
-
-    return result
-end
-
-local function httpGetWithTimeout(url, timeoutSec)
-    timeoutSec = timeoutSec or HTTP_TIMEOUT
-
-    local finished = false
-    local success = false
-    local response = nil
-
-    task.spawn(function()
-        success, response = pcall(function()
-            return game:HttpGet(url)
-        end)
-
-        finished = true
-    end)
-
-    local elapsed = 0
-    local step = 0.1
-
-    while not finished and elapsed < timeoutSec do
-        task.wait(step)
-        elapsed += step
-    end
-
-    if not finished then
-        return false, "timeout"
-    end
-
-    if not success then
-        return false, response
-    end
-
-    if type(response) ~= "string" or response == "" then
-        return false, "empty response"
-    end
-
-    return true, response
-end
-
-local function safeHttpGet(url)
-    local lastErr
-
-    for attempt = 1, MAX_ATTEMPTS do
-        local ok, result = httpGetWithTimeout(url, HTTP_TIMEOUT)
-
-        if ok then
-            return true, result
-        end
-
-        lastErr = result
-
-        if attempt < MAX_ATTEMPTS then
-            task.wait(attempt)
-        end
-    end
-
-    return false, lastErr
-end
-
-local function classifyError(errText)
-    errText = tostring(errText or ""):lower()
-
-    if errText:find("404", 1, true) then
-        return "NOT_FOUND (404): archivo no encontrado."
-    end
-
-    if errText:find("403", 1, true) then
-        return "403: acceso bloqueado temporalmente."
-    end
-
-    if errText:find("429", 1, true) then
-        return "429: demasiadas peticiones."
-    end
-
-    if errText:find("timeout", 1, true) or errText:find("timed out", 1, true) then
-        return "TIMEOUT: el servidor no respondió a tiempo."
-    end
-
-    if errText == "" then
-        return "Respuesta vacía."
-    end
-
-    return "Error: " .. errText
-end
-
-local function executePackage(pack)
-    local cfg = PACKAGES[pack]
-
-    if not cfg then
-        return nil, "Paquete no definido: " .. tostring(pack)
-    end
-
-    local url = BASE_URL .. cfg.path
-    local ok, content = safeHttpGet(url)
-
-    if not ok then
-        return nil, classifyError(content)
-    end
-
-    local compiled, compileError = loadstring(content)
-
-    if not compiled then
-        return nil, "El paquete no compila: " .. tostring(compileError)
-    end
-
-    local executed, raw = pcall(compiled)
-
-    if not executed then
-        return nil, "El paquete produjo un error al ejecutarse: " .. tostring(raw)
-    end
-
-    if type(raw) ~= "table" then
-        return nil, "El paquete no devolvió una tabla."
-    end
-
-    if cfg.type == "sprite" then
-        if type(raw.Spritesheets) ~= "table" then
-            return nil, "Falta la tabla 'Spritesheets'."
-        end
-
-        if type(raw.Icons) ~= "table" then
-            return nil, "Falta la tabla 'Icons'."
-        end
-
-        return {
-            spritesheets = raw.Spritesheets,
-            icons = raw.Icons,
-        }
-    end
-
-    return raw
-end
-
-local function loadPackageInternal(pack, forceRefresh)
-    if not forceRefresh and packageLoaded[pack] then
-        return packageCache[pack]
-    end
-
-    if packageLoading[pack] then
-        return nil
-    end
-
-    packageLoading[pack] = true
-
-    local result
-    local err
-
-    if not forceRefresh then
-        result = loadPackageFromDisk(pack)
-    end
-
-    if not result then
-        result, err = executePackage(pack)
-
-        if result then
-            savePackageToDisk(pack, result)
-        end
-    end
-
-    packageLoading[pack] = nil
-
-    if not result then
-        lastError[pack] = err or "Fallo desconocido."
-        reportError(pack, lastError[pack])
-        return nil
-    end
-
-    packageCache[pack] = result
-    packageLoaded[pack] = true
-    lastError[pack] = nil
-
-    return result
-end
-
-function IconLoader.LoadPackage(name, forceRefresh)
-    local pack = resolvePackageName(name)
-
-    if not pack then
-        local valid = {}
-
-        for key in pairs(PACKAGES) do
-            valid[#valid + 1] = key
-        end
-
-        table.sort(valid)
-
-        local message = "Paquete desconocido: '" ..
-            tostring(name) ..
-            "'. Válidos: " ..
-            table.concat(valid, ", ")
-
-        lastError[tostring(name)] = message
-        reportError(name, message)
-
-        return nil
-    end
-
-    return loadPackageInternal(pack, forceRefresh == true)
-end
-
-function IconLoader.Get(packName, iconName)
-    local pack = resolvePackageName(packName)
-
-    if not pack or type(iconName) ~= "string" then
-        return nil
-    end
-
-    loadUsedCacheFromDisk()
-
-    local cached = usedCache[keyFor(pack, iconName)]
-
-    if cached ~= nil then
+    local cached = readCache(name)
+    if cached then
+        log("INFO", "Pack '%s' desde cache", name)
         return cached
     end
 
-    local data = IconLoader.LoadPackage(pack)
-
-    if not data then
+    local ok, raw = pcall(function() return game:HttpGet(BASE_URL .. def.path) end)
+    if not ok or type(raw) ~= "string" or #raw < 10 then
+        IconLoader.errors[name] = classifyError(raw)
+        log("ERROR", "Fallo descargando '%s': %s", name, IconLoader.errors[name])
         return nil
     end
 
-    local result
-    local cfg = PACKAGES[pack]
+    local ok2, result = pcall(function()
+        local fn = loadstring(raw)
+        if not fn then error("loadstring devolvio nil") end
+        return fn()
+    end)
 
-    if cfg.type == "sprite" then
-        result = data.icons[iconName]
-    else
-        result = data[iconName]
+    if not ok2 or type(result) ~= "table" then
+        IconLoader.errors[name] = classifyError(result)
+        log("ERROR", "Pack '%s' invalido: %s", name, IconLoader.errors[name])
+        return nil
     end
 
-    if result ~= nil then
-        rememberUsedResource(pack, iconName, result)
-        return result
+    writeCache(name, result)
+    log("INFO", "Pack '%s' cargado", name)
+    return result
+end
+
+-- asegura que un pack esté en memoria (lo carga si hace falta)
+local function ensurePack(name)
+    if IconLoader.loaded[name] then return IconLoader.loaded[name] end
+    if IconLoader.loading[name] then
+        local t = 0
+        while IconLoader.loading[name] and t < 10 do
+            task.wait(0.1) t = t + 0.1
+        end
+        return IconLoader.loaded[name]
     end
+    IconLoader.loading[name] = true
+    local data = fetchPack(name)
+    IconLoader.loading[name] = nil
+    if data then IconLoader.loaded[name] = data end
+    return data
+end
 
-    reportError(
-        iconName,
-        ("El recurso '%s' no existe en '%s'."):format(
-            iconName,
-            pack
-        )
-    )
+-- normaliza nombres: quita espacios, guiones y baja a minúsculas
+local function normalizeKey(k)
+    return tostring(k or ""):lower():gsub("[%s_%-]", "")
+end
 
+-- busca un icono dentro de un pack ya cargado
+local function findInPack(pack, name)
+    local data = IconLoader.loaded[pack]
+    if not data then return nil end
+    local target = normalizeKey(name)
+    if data[name] then return data[name] end
+    if data[target] then return data[target] end
+    for k, v in pairs(data) do
+        if normalizeKey(k) == target then return v end
+    end
     return nil
 end
 
-function IconLoader.GetAny(packNames, iconName)
-    if type(packNames) ~= "table" then
-        return nil
+-- api
+-- Get(pack, name) — obtiene un icono específico de un pack
+function IconLoader.Get(pack, name)
+    if type(pack) ~= "string" or type(name) ~= "string" then return nil end
+    ensurePack(pack)
+    return findInPack(pack, name)
+end
+
+-- Find(name) — busca un icono en TODOS los packs
+function IconLoader.Find(name)
+    for pack in pairs(IconLoader.loaded) do
+        local id = findInPack(pack, name)
+        if id then return id end
     end
-
-    for _, packName in ipairs(packNames) do
-        local result = IconLoader.Get(packName, iconName)
-
-        if result ~= nil then
-            return result, resolvePackageName(packName)
-        end
+    for _, pack in ipairs({"lucide", "solar", "gravity", "fluent", "material"}) do
+        local id = IconLoader.Get(pack, name)
+        if id then return id end
     end
-
     return nil
 end
 
-function IconLoader.GetSound(name)
-    return IconLoader.Get("sounds", name)
+-- GetAny({packs}, name) — prueba varios packs en orden
+function IconLoader.GetAny(list, name)
+    if type(list) ~= "table" then return nil end
+    for _, pack in ipairs(list) do
+        local id = IconLoader.Get(pack, name)
+        if id then return id end
+    end
+    return nil
 end
 
-function IconLoader.Refresh(packName)
-    local pack = resolvePackageName(packName)
+-- List() — devuelve la lista de packs disponibles
+function IconLoader.List()
+    local out = {}
+    for name in pairs(PACKAGES) do out[#out+1] = name end
+    table.sort(out)
+    return out
+end
 
-    if not pack then
-        return nil
+-- Packs() — devuelve metadata de cada pack
+function IconLoader.Packs()
+    local out = {}
+    for name, def in pairs(PACKAGES) do
+        out[name] = {
+            type = def.type,
+            path = def.path,
+            loaded = IconLoader.loaded[name] ~= nil,
+            error = IconLoader.errors[name],
+        }
     end
+    return out
+end
 
-    packageCache[pack] = nil
-    packageLoaded[pack] = nil
+-- Search(query) — busca iconos por nombre en packs cargados
+function IconLoader.Search(query)
+    local q = normalizeKey(query)
+    if q == "" then return {} end
+    local out = {}
+    for pack, data in pairs(IconLoader.loaded) do
+        for name, id in pairs(data) do
+            if normalizeKey(name):find(q, 1, true) then
+                out[#out+1] = { pack=pack, name=name, id=id }
+            end
+        end
+    end
+    return out
+end
 
-    local path = packageCacheFilePath(pack)
+-- Help() — texto de ayuda rápida
+function IconLoader.Help()
+    return ([[
+IconLoader v%s
 
-    pcall(function()
-        if isfile(path) then
-            delfile(path)
+Get(pack, name) | Find(name) | GetAny({packs}, name)
+List() | Packs() | Search(query) | Help() | Spec()
+Ready(timeout) | Refresh(pack) | MakeIcon(name, size, parent) | Errors()
+
+Packs: %s
+]]):format(IconLoader.version, table.concat(IconLoader.List(), ", "))
+end
+
+-- Spec() — descripción máquina-legible de la API
+function IconLoader.Spec()
+    return {
+        name = "IconLoader",
+        version = IconLoader.version,
+        packages = (function()
+            local p = {}
+            for name, def in pairs(PACKAGES) do
+                p[name] = { path = def.path, type = def.type }
+            end
+            return p
+        end)(),
+        functions = {
+            Get      = { params = {"pack: string", "name: string"}, returns = "string|nil" },
+            Find     = { params = {"name: string"},                 returns = "string|nil" },
+            GetAny   = { params = {"list: table", "name: string"},  returns = "string|nil" },
+            List     = { params = {},                               returns = "table" },
+            Packs    = { params = {},                               returns = "table" },
+            Search   = { params = {"query: string"},                returns = "table" },
+            Help     = { params = {},                               returns = "string" },
+            Spec     = { params = {},                               returns = "table" },
+            Ready    = { params = {"timeout: number?"},             returns = "bool" },
+            Refresh  = { params = {"pack: string"},                 returns = "bool" },
+            MakeIcon = { params = {"name", "size?", "parent?"},     returns = "ImageLabel" },
+            Errors   = { params = {},                               returns = "table" },
+        },
+    }
+end
+
+-- Ready(timeout) — espera a que los packs prioritarios estén cargados
+function IconLoader.Ready(timeout)
+    if IconLoader.ready then return true end
+    timeout = timeout or 15
+    local priority = {"lucide", "solar", "gravity"}
+    local done = 0
+
+    task.spawn(function()
+        for _, pack in ipairs(priority) do
+            pcall(ensurePack, pack)
+            done = done + 1
         end
     end)
 
-    return IconLoader.LoadPackage(pack, true)
-end
-
-function IconLoader.Diagnose(packName)
-    local pack = resolvePackageName(packName) or packName
-    return lastError[pack]
-end
-
-function IconLoader.ListPackages()
-    local names = {}
-
-    for key in pairs(PACKAGES) do
-        names[#names + 1] = key
+    local t = 0
+    while done < #priority and t < timeout do
+        task.wait(0.1) t = t + 0.1
     end
 
-    table.sort(names)
-
-    return names
+    IconLoader.ready = true
+    for _, cb in ipairs(IconLoader._waiters) do pcall(cb) end
+    IconLoader._waiters = {}
+    return done == #priority
 end
 
-function IconLoader.ListUsedIcons()
-    loadUsedCacheFromDisk()
-
-    local copy = {}
-
-    for key, value in pairs(usedCache) do
-        copy[key] = value
-    end
-
-    return copy
+-- Refresh(pack) — borra el cache de un pack y lo vuelve a descargar
+function IconLoader.Refresh(pack)
+    if not PACKAGES[pack] then return false end
+    local p = cachePath(pack)
+    if fileExists(p) and type(delfile) == "function" then pcall(delfile, p) end
+    IconLoader.loaded[pack] = nil
+    IconLoader.errors[pack] = nil
+    return ensurePack(pack) ~= nil
 end
 
-function IconLoader.ClearUsedCache()
-    usedCache = {}
+-- MakeIcon(name, size, parent) — crea un ImageLabel listo para usar
+function IconLoader.MakeIcon(name, size, parent)
+    size = size or 24
+    local id = IconLoader.Find(name) or "rbxasset://textures/ui/GuiImagePlaceholder.png"
 
-    pcall(function()
-        if isfile(USED_FILE) then
-            delfile(USED_FILE)
-        end
-    end)
-end
+    local img = Instance.new("ImageLabel")
+    img.Name = "Icon_" .. tostring(name)
+    img.Image = id
+    img.Size = UDim2.fromOffset(size, size)
+    img.BackgroundTransparency = 1
+    img.ScaleType = Enum.ScaleType.Fit
+    img.ImageColor3 = Color3.fromRGB(255, 255, 255)
+    if parent then img.Parent = parent end
 
-function IconLoader.ClearPackageCache(packName)
-    local pack = resolvePackageName(packName)
-
-    if not pack then
-        return false
-    end
-
-    packageCache[pack] = nil
-    packageLoaded[pack] = nil
-    lastError[pack] = nil
-
-    pcall(function()
-        local path = packageCacheFilePath(pack)
-
-        if isfile(path) then
-            delfile(path)
+    task.spawn(function()
+        local t = 0
+        while not img.IsLoaded and t < 5 do task.wait(0.1) t = t + 0.1 end
+        if not img.IsLoaded then
+            img.Image = "rbxasset://textures/ui/GuiImagePlaceholder.png"
+            log("WARN", "Icono '%s' no cargó", tostring(name))
         end
     end)
 
-    return true
+    return img
 end
 
-function IconLoader.ClearAllPackageCaches()
-    for pack in pairs(PACKAGES) do
-        IconLoader.ClearPackageCache(pack)
-    end
+-- Errors() — devuelve los errores por pack
+function IconLoader.Errors() return IconLoader.errors end
+
+-- OnReady(callback) — ejecuta callback cuando el loader esté listo
+function IconLoader.OnReady(callback)
+    if IconLoader.ready then pcall(callback)
+    else IconLoader._waiters[#IconLoader._waiters + 1] = callback end
 end
 
-function IconLoader.IsLoaded(packName)
-    local pack = resolvePackageName(packName)
-    return pack ~= nil and packageLoaded[pack] == true
-end
+-- init
+log("INFO", "IconLoader v%s inicializando...", IconLoader.version)
+
+task.spawn(function()
+    pcall(function() IconLoader.Ready(15) end)
+    local n = 0
+    for _ in pairs(IconLoader.loaded) do n = n + 1 end
+    log("INFO", "IconLoader listo. Packs: %d", n)
+end)
 
 return IconLoader
