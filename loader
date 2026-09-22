@@ -1,259 +1,102 @@
 --[[
 BLADEX ICON LOADER
-Version: 5.0.0
-
-CACHE POR PACK
-
-Ahora el loader NO crea:
-    icon_settings.json
-    icon_house.json
-    icon_squareterminal.json
-
-En su lugar crea:
-
-    Bladex/assets/
-        lucide.json
-        bladex.json
-        solar.json
-        gravity.json
-        fluent.json
-        material.json
-        sfsymbols.json
-        craft.json
-        geist.json
-
-Ejemplo de lucide.json:
-
-{
-    "version": 1,
-    "source": "lucide",
-    "timestamp": 0,
-    "icons": {
-        "settings": "rbxassetid://123",
-        "house": "rbxassetid://456",
-        "square-terminal": "rbxassetid://789",
-        "gamepad-2": "rbxassetid://999"
-    }
-}
-
-IMPORTANTE:
-- Solo se guardan los iconos que fueron solicitados.
-- Si solicitas 4 iconos de Lucide, lucide.json tendrá esos 4.
-- Si posteriormente solicitas otro icono, se agrega al mismo lucide.json.
-- No se crea un JSON adicional para ese icono.
-- No se inventan IDs.
-- No usa emojis, glifos, PNG, SVG ni placeholders.
-- Solo acepta IDs con formato rbxassetid://NUMERO.
-
-USO:
-
-local IL = loadstring(game:HttpGet(
-    "https://raw.githubusercontent.com/BladexDevX/loader/refs/heads/main/loader"
-))()
-
-local icons = IL.Load({
-    "settings",
-    "house",
-    "square-terminal",
-    "gamepad-2"
-})
-
-local image = Instance.new("ImageLabel")
-image.BackgroundTransparency = 1
-image.Size = UDim2.fromOffset(32, 32)
-image.Image = icons.settings or ""
-image.Parent = frame
-
-FUNCIONES:
-IL.Load({"settings", "house"})
-IL.Find("settings")
-IL.Get("lucide", "settings")
-IL.GetAny({"lucide", "bladex"}, "settings")
-IL.MakeIcon("settings", 32, parent)
-IL.Search("arrow")
-IL.List()
-IL.Packs()
-IL.Cache("lucide")
-IL.Refresh("lucide")
-IL.RefreshIcon("settings")
-IL.Errors()
-IL.Spec()
-IL.Help()
---]]
+Version: 1.0.0
+Objetivo:
+- Cache persistente: un JSON por pack.
+- Cache en memoria siempre disponible.
+- Filesystem completamente opcional.
+- HTTP protegido con pcall.
+- loadstring protegido con pcall.
+- Una fuente rota no rompe las demas.
+- Un icono no encontrado no detiene Load().
+- Search(), Refresh() y RefreshIcon() protegidos.
+- Sin asumir que el executor tiene todas las funciones.
+]]
 
 local HttpService = game:GetService("HttpService")
 
-local BASE_URL =
-    "https://raw.githubusercontent.com/BladexDevX/loader/refs/heads/main/"
-
+local BASE_URL = "https://raw.githubusercontent.com/BladexDevX/loader/refs/heads/main/"
 local CACHE_DIR = "Bladex/assets/"
 local CACHE_TTL = 86400
+local HTTP_TIMEOUT = 10
 
 local SOURCES = {
-    {
-        name = "bladex",
-        path = "Icons%20bladex.lua",
-        type = "icon",
-    },
-
-    {
-        name = "lucide",
-        path = "Icons/lucide.lua",
-        type = "icon",
-    },
-
-    {
-        name = "solar",
-        path = "Icons/solar.lua",
-        type = "icon",
-    },
-
-    {
-        name = "gravity",
-        path = "Icons/gravity.lua",
-        type = "icon",
-    },
-
-    {
-        name = "fluent",
-        path = "Icons/fluent.lua",
-        type = "icon",
-    },
-
-    {
-        name = "material",
-        path = "Icons/material.lua",
-        type = "icon",
-    },
-
-    {
-        name = "sfsymbols",
-        path = "Icons/sfsymbols.lua",
-        type = "icon",
-    },
-
-    {
-        name = "craft",
-        path = "Icons/craft.lua",
-        type = "icon",
-    },
-
-    {
-        name = "geist",
-        path = "Icons/geist.lua",
-        type = "icon",
-    },
+    {name = "bladex",     path = "Icons%20bladex.lua", type = "icon"},
+    {name = "lucide",     path = "Icons/lucide.lua",   type = "icon"},
+    {name = "solar",      path = "Icons/solar.lua",    type = "icon"},
+    {name = "gravity",    path = "Icons/gravity.lua",  type = "icon"},
+    {name = "fluent",     path = "Icons/fluent.lua",   type = "icon"},
+    {name = "material",   path = "Icons/material.lua", type = "icon"},
+    {name = "sfsymbols",  path = "Icons/sfsymbols.lua",type = "icon"},
+    {name = "craft",      path = "Icons/craft.lua",    type = "icon"},
+    {name = "geist",      path = "Icons/geist.lua",    type = "icon"},
 }
 
-local IconLoader = {
-    version = "5.0.0",
-
+local Loader = {
+    version = "1.0.0",
     loaded = {},
     sourceData = {},
     sourceCache = {},
     loading = {},
-
     errors = {},
     requested = {},
-
     ready = false,
     _waiters = {},
+
+    aliases = {
+        home = "house",
+        terminal = "square-terminal",
+        gamepad = "gamepad-2",
+        logo = "bladex-hud-logo",
+    },
 }
 
+-- SAFE UTILITIES
+
+local function safeCall(fn, ...)
+    if type(fn) ~= "function" then
+        return false, nil
+    end
+
+    return pcall(fn, ...)
+end
+
 local function log(level, message, ...)
-    local text = tostring(message)
+    local text = tostring(message or "")
 
     if select("#", ...) > 0 then
-        local ok, formatted = pcall(string.format, message, ...)
+        local ok, formatted = pcall(string.format, text, ...)
         if ok then
             text = formatted
         end
     end
 
-    local line =
-        "[IconLoader][" ..
-        tostring(level) ..
-        "] " ..
-        text
+    local line = "[IconLoader][" .. tostring(level) .. "] " .. text
 
     if level == "ERROR" or level == "WARN" then
         if type(warn) == "function" then
-            warn(line)
+            pcall(warn, line)
         elseif type(print) == "function" then
-            print(line)
+            pcall(print, line)
         end
     elseif type(print) == "function" then
-        print(line)
+        pcall(print, line)
     end
-end
-
-local function canWrite()
-    return type(isfile) == "function"
-        and type(readfile) == "function"
-        and type(writefile) == "function"
-end
-
-local function fileExists(path)
-    return type(isfile) == "function"
-        and isfile(path)
-end
-
-local function dirExists(path)
-    return type(isfolder) == "function"
-        and isfolder(path)
-end
-
-local function ensureDir(dir)
-    if not canWrite() then
-        return false
-    end
-
-    if dirExists(dir) then
-        return true
-    end
-
-    local current = ""
-
-    for part in dir:gmatch("[^/]+") do
-        if current == "" then
-            current = part
-        else
-            current = current .. "/" .. part
-        end
-
-        if not dirExists(current) then
-            local ok = pcall(makefolder, current)
-
-            if not ok and not dirExists(current) then
-                return false
-            end
-        end
-    end
-
-    return dirExists(dir)
 end
 
 local function normalizeKey(value)
     local text = tostring(value or ""):lower()
-
     text = text:gsub("[%s_%-]+", "")
-
     return text
 end
 
 local function safePackName(pack)
     local name = tostring(pack or ""):lower()
-
     name = name:gsub("[^%w_%-]", "")
-
-    if name == "" then
-        name = "unknown"
-    end
-
-    return name
+    return name ~= "" and name or "unknown"
 end
 
-local function packCachePath(pack)
+local function cachePath(pack)
     return CACHE_DIR .. safePackName(pack) .. ".json"
 end
 
@@ -262,38 +105,257 @@ local function isAssetId(value)
         and value:match("^rbxassetid://%d+$") ~= nil
 end
 
-local function classifyError(value)
-    local text = tostring(value or ""):lower()
-
-    if text:find("404", 1, true)
-        or text:find("not found", 1, true) then
-        return "NOT_FOUND"
-    end
-
-    if text:find("403", 1, true)
-        or text:find("forbidden", 1, true) then
-        return "FORBIDDEN"
-    end
-
-    if text:find("429", 1, true)
-        or text:find("rate limit", 1, true) then
-        return "RATE_LIMIT"
-    end
-
-    if text:find("timeout", 1, true) then
-        return "TIMEOUT"
-    end
-
-    if text == "" then
-        return "EMPTY"
-    end
-
-    return "UNKNOWN"
+local function now()
+    local ok, value = pcall(os.time)
+    return ok and tonumber(value) or 0
 end
 
-local function sourceUrl(source)
-    return BASE_URL .. source.path
+local function safeTaskWait(seconds)
+    if type(task) == "table" and type(task.wait) == "function" then
+        pcall(task.wait, seconds)
+    end
 end
+
+-- OPTIONAL FILESYSTEM
+
+local function fsAvailable()
+    return type(isfile) == "function"
+        and type(readfile) == "function"
+        and type(writefile) == "function"
+end
+
+local function fileExists(path)
+    if type(isfile) ~= "function" then
+        return false
+    end
+
+    local ok, result = pcall(isfile, path)
+    return ok and result == true
+end
+
+local function folderExists(path)
+    if type(isfolder) ~= "function" then
+        return false
+    end
+
+    local ok, result = pcall(isfolder, path)
+    return ok and result == true
+end
+
+local function ensureFolder(path)
+    if not fsAvailable() or type(makefolder) ~= "function" then
+        return false
+    end
+
+    if folderExists(path) then
+        return true
+    end
+
+    local current = ""
+
+    for part in tostring(path):gmatch("[^/]+") do
+        current = current == "" and part or current .. "/" .. part
+
+        if not folderExists(current) then
+            pcall(makefolder, current)
+        end
+    end
+
+    return folderExists(path)
+end
+
+-- HTTP
+
+local function httpGet(url)
+    if type(url) ~= "string" or url == "" then
+        return nil, "INVALID_URL"
+    end
+
+    -- game:HttpGet, solo si existe.
+    local okMethod, method = pcall(function()
+        return game.HttpGet
+    end)
+
+    if okMethod and type(method) == "function" then
+        local ok, result = pcall(function()
+            return game:HttpGet(url)
+        end)
+
+        if ok and type(result) == "string" and #result > 0 then
+            return result
+        end
+    end
+
+    -- HttpService:GetAsync como segundo metodo.
+    local okService, serviceResult = pcall(function()
+        return HttpService:GetAsync(url)
+    end)
+
+    if okService and type(serviceResult) == "string" and #serviceResult > 0 then
+        return serviceResult
+    end
+
+    return nil, "HTTP_FAILED"
+end
+
+-- MEMORY CACHE
+
+local function getMemoryCache(pack)
+    local data = Loader.sourceCache[pack]
+
+    if type(data) == "table" and type(data.icons) == "table" then
+        return data
+    end
+
+    return nil
+end
+
+local function setMemoryCache(pack, icons)
+    if type(pack) ~= "string" or type(icons) ~= "table" then
+        return false
+    end
+
+    Loader.sourceCache[pack] = {
+        version = 1,
+        source = pack,
+        timestamp = now(),
+        icons = icons,
+    }
+
+    return true
+end
+
+-- JSON CACHE
+
+local function readFileCache(pack)
+    if not fsAvailable() then
+        return nil
+    end
+
+    local path = cachePath(pack)
+
+    if not fileExists(path) then
+        return nil
+    end
+
+    local okRead, raw = pcall(readfile, path)
+
+    if not okRead or type(raw) ~= "string" or raw == "" then
+        return nil
+    end
+
+    local okJson, data = pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+
+    if not okJson or type(data) ~= "table" or type(data.icons) ~= "table" then
+        return nil
+    end
+
+    local stamp = tonumber(data.timestamp) or 0
+
+    if stamp > 0 and now() > stamp and now() - stamp > CACHE_TTL then
+        return nil
+    end
+
+    return data
+end
+
+local function writeFileCache(pack, icons)
+    if not fsAvailable() or type(icons) ~= "table" then
+        return false
+    end
+
+    if not ensureFolder(CACHE_DIR) then
+        return false
+    end
+
+    local clean = {}
+
+    for name, id in pairs(icons) do
+        if type(name) == "string" and isAssetId(tostring(id)) then
+            clean[name] = tostring(id)
+        end
+    end
+
+    local payload = {
+        version = 1,
+        source = pack,
+        timestamp = now(),
+        icons = clean,
+    }
+
+    local okEncode, raw = pcall(function()
+        return HttpService:JSONEncode(payload)
+    end)
+
+    if not okEncode or type(raw) ~= "string" then
+        return false
+    end
+
+    local okWrite = pcall(writefile, cachePath(pack), raw)
+    return okWrite
+end
+
+local function readPackCache(pack)
+    local memory = getMemoryCache(pack)
+    if memory then
+        return memory
+    end
+
+    local file = readFileCache(pack)
+    if file then
+        Loader.sourceCache[pack] = file
+        return file
+    end
+
+    return nil
+end
+
+local function writePackCache(pack, icons)
+    setMemoryCache(pack, icons)
+    writeFileCache(pack, icons)
+    return true
+end
+
+local function removePackCache(pack)
+    Loader.sourceCache[pack] = nil
+
+    if type(delfile) ~= "function" then
+        return true
+    end
+
+    local path = cachePath(pack)
+
+    if not fileExists(path) then
+        return true
+    end
+
+    local ok = pcall(delfile, path)
+    return ok
+end
+
+local function mergePackCache(pack, name, id)
+    if type(name) ~= "string" or not isAssetId(tostring(id)) then
+        return false
+    end
+
+    local current = readPackCache(pack)
+    local icons = {}
+
+    if current and type(current.icons) == "table" then
+        for iconName, iconId in pairs(current.icons) do
+            if type(iconName) == "string" and isAssetId(tostring(iconId)) then
+                icons[iconName] = tostring(iconId)
+            end
+        end
+    end
+
+    icons[name] = tostring(id)
+    return writePackCache(pack, icons)
+end
+
+-- SOURCES
 
 local function getSourceByName(name)
     local wanted = tostring(name or ""):lower()
@@ -307,178 +369,35 @@ local function getSourceByName(name)
     return nil
 end
 
-local function readPackCache(pack)
-    if not canWrite() then
-        return nil
-    end
-
-    local path = packCachePath(pack)
-
-    if not fileExists(path) then
-        return nil
-    end
-
-    local ok, raw = pcall(readfile, path)
-
-    if not ok
-        or type(raw) ~= "string"
-        or raw == "" then
-        return nil
-    end
-
-    local okJson, data = pcall(function()
-        return HttpService:JSONDecode(raw)
-    end)
-
-    if not okJson
-        or type(data) ~= "table"
-        or type(data.icons) ~= "table" then
-        return nil
-    end
-
-    local timestamp = tonumber(data.timestamp) or 0
-
-    if timestamp > 0
-        and os.time() - timestamp > CACHE_TTL then
-        return nil
-    end
-
-    return data
-end
-
-local function writePackCache(pack, icons)
-    if not canWrite() then
-        return false
-    end
-
-    if type(icons) ~= "table" then
-        return false
-    end
-
-    if not ensureDir(CACHE_DIR) then
-        return false
-    end
-
-    local payload = {
-        version = 1,
-        source = tostring(pack),
-        timestamp = os.time(),
-        icons = {},
-    }
-
-    for name, id in pairs(icons) do
-        if type(name) == "string"
-            and isAssetId(tostring(id)) then
-            payload.icons[name] = tostring(id)
-        end
-    end
-
-    local ok = pcall(function()
-        local encoded =
-            HttpService:JSONEncode(payload)
-
-        writefile(
-            packCachePath(pack),
-            encoded
-        )
-    end)
-
-    if not ok then
-        log(
-            "WARN",
-            "No se pudo escribir cache de '%s'",
-            tostring(pack)
-        )
-    end
-
-    return ok
-end
-
-local function mergePackCache(pack, additions)
-    if type(additions) ~= "table" then
-        return false
-    end
-
-    local existing = readPackCache(pack)
-
-    local icons = {}
-
-    if existing
-        and type(existing.icons) == "table" then
-
-        for name, id in pairs(existing.icons) do
-            if isAssetId(tostring(id)) then
-                icons[name] = tostring(id)
-            end
-        end
-    end
-
-    for name, id in pairs(additions) do
-        if type(name) == "string"
-            and isAssetId(tostring(id)) then
-
-            icons[name] = tostring(id)
-        end
-    end
-
-    return writePackCache(pack, icons)
-end
-
-local function removePackCache(pack)
-    if type(delfile) ~= "function" then
-        return false
-    end
-
-    local path = packCachePath(pack)
-
-    if not fileExists(path) then
-        return true
-    end
-
-    local ok = pcall(delfile, path)
-
-    if ok then
-        IconLoader.sourceCache[pack] = nil
-    end
-
-    return ok
-end
-
 local function decodeSource(raw, sourceName)
+    if type(raw) ~= "string" or raw == "" then
+        Loader.errors[sourceName] = "EMPTY_SOURCE"
+        return nil
+    end
+
+    if type(loadstring) ~= "function" then
+        Loader.errors[sourceName] = "LOADSTRING_UNAVAILABLE"
+        return nil
+    end
+
     local ok, result = pcall(function()
-        local fn = loadstring(raw)
+        local fn, compileError = loadstring(raw)
 
         if type(fn) ~= "function" then
-            error("LOADSTRING_FAILED")
+            error(tostring(compileError or "COMPILE_FAILED"))
         end
 
         return fn()
     end)
 
     if not ok then
-        IconLoader.errors[sourceName] =
-            classifyError(result)
-
-        log(
-            "ERROR",
-            "Fuente '%s' invalida: %s",
-            sourceName,
-            tostring(result)
-        )
-
+        Loader.errors[sourceName] = "INVALID_SOURCE"
+        log("WARN", "Fuente '%s' fallo y sera omitida.", sourceName)
         return nil
     end
 
     if type(result) ~= "table" then
-        IconLoader.errors[sourceName] =
-            "INVALID_TABLE"
-
-        log(
-            "ERROR",
-            "Fuente '%s' no devolvio una tabla",
-            sourceName
-        )
-
+        Loader.errors[sourceName] = "INVALID_TABLE"
         return nil
     end
 
@@ -492,65 +411,47 @@ local function fetchSource(source)
 
     local sourceName = source.name
 
-    if IconLoader.sourceData[sourceName] then
-        return IconLoader.sourceData[sourceName]
+    if Loader.sourceData[sourceName] ~= nil then
+        return Loader.sourceData[sourceName]
     end
 
-    if IconLoader.loading[sourceName] then
+    if Loader.loading[sourceName] then
         local started = os.clock()
 
-        while IconLoader.loading[sourceName]
-            and os.clock() - started < 10 do
-
-            task.wait(0.1)
+        while Loader.loading[sourceName] do
+            if os.clock() - started >= HTTP_TIMEOUT then
+                Loader.loading[sourceName] = nil
+                return nil
+            end
+            safeTaskWait(0.05)
         end
 
-        return IconLoader.sourceData[sourceName]
+        return Loader.sourceData[sourceName]
     end
 
-    IconLoader.loading[sourceName] = true
-    IconLoader.errors[sourceName] = nil
+    Loader.loading[sourceName] = true
+    Loader.errors[sourceName] = nil
 
-    local ok, raw = pcall(function()
-        return game:HttpGet(sourceUrl(source))
-    end)
+    local raw, reason = httpGet(BASE_URL .. source.path)
 
-    if not ok
-        or type(raw) ~= "string"
-        or #raw < 5 then
-
-        IconLoader.errors[sourceName] =
-            classifyError(raw)
-
-        IconLoader.loading[sourceName] = nil
-
-        log(
-            "ERROR",
-            "No se pudo descargar '%s': %s",
-            sourceName,
-            tostring(IconLoader.errors[sourceName])
-        )
-
+    if not raw then
+        Loader.errors[sourceName] = reason or "HTTP_FAILED"
+        Loader.loading[sourceName] = nil
         return nil
     end
 
-    local data =
-        decodeSource(raw, sourceName)
+    local data = decodeSource(raw, sourceName)
 
-    IconLoader.loading[sourceName] = nil
+    Loader.loading[sourceName] = nil
 
     if data then
-        IconLoader.sourceData[sourceName] = data
-
-        log(
-            "INFO",
-            "Fuente '%s' cargada",
-            sourceName
-        )
+        Loader.sourceData[sourceName] = data
     end
 
     return data
 end
+
+-- SEARCH
 
 local function findInData(data, name)
     if type(data) ~= "table" then
@@ -558,11 +459,13 @@ local function findInData(data, name)
     end
 
     local requested = tostring(name or "")
-    local normalized = normalizeKey(requested)
+    local direct = data[requested]
 
-    if data[requested] ~= nil then
-        return data[requested], requested
+    if direct ~= nil then
+        return direct, requested
     end
+
+    local normalized = normalizeKey(requested)
 
     if data[normalized] ~= nil then
         return data[normalized], normalized
@@ -577,55 +480,24 @@ local function findInData(data, name)
     return nil
 end
 
-local function resolveAlias(name)
-    local key = normalizeKey(name)
+local function findInCache(pack, name)
+    local cache = readPackCache(pack)
 
-    for alias, target in pairs(IconLoader.aliases) do
-        if normalizeKey(alias) == key then
-            return target
-        end
-    end
-
-    return name
-end
-
-IconLoader.aliases = {
-    home = "house",
-    terminal = "square-terminal",
-    gamepad = "gamepad-2",
-    logo = "bladex-hud-logo",
-}
-
-local function findInPackCache(pack, name)
-    local data = IconLoader.sourceCache[pack]
-
-    if not data then
-        data = readPackCache(pack)
-
-        if data then
-            IconLoader.sourceCache[pack] = data
-        end
-    end
-
-    if not data
-        or type(data.icons) ~= "table" then
+    if not cache or type(cache.icons) ~= "table" then
         return nil
     end
 
     local requested = tostring(name or "")
+    local direct = cache.icons[requested]
 
-    local direct = data.icons[requested]
-
-    if direct and isAssetId(direct) then
-        return direct
+    if isAssetId(direct) then
+        return direct, requested
     end
 
     local normalized = normalizeKey(requested)
 
-    for iconName, id in pairs(data.icons) do
-        if normalizeKey(iconName) == normalized
-            and isAssetId(tostring(id)) then
-
+    for iconName, id in pairs(cache.icons) do
+        if normalizeKey(iconName) == normalized and isAssetId(tostring(id)) then
             return tostring(id), iconName
         end
     end
@@ -633,664 +505,11 @@ local function findInPackCache(pack, name)
     return nil
 end
 
-local function loadOne(name, sourceList)
-    if type(name) ~= "string"
-        or name == "" then
-        return nil
-    end
-
-    local requestedName = name
-    local lookupName = resolveAlias(name)
-
-    if IconLoader.loaded[requestedName] then
-        return IconLoader.loaded[requestedName]
-    end
-
-    local sources = sourceList or SOURCES
-
-    for _, source in ipairs(sources) do
-        local cachedId, cachedName =
-            findInPackCache(
-                source.name,
-                lookupName
-            )
-
-        if cachedId and isAssetId(cachedId) then
-            IconLoader.loaded[requestedName] =
-                cachedId
-
-            IconLoader.requested[requestedName] =
-                true
-
-            return cachedId,
-                cachedName or lookupName,
-                source.name
-        end
-    end
-
-    for _, source in ipairs(sources) do
-        local data = fetchSource(source)
-
-        local id, actualName =
-            findInData(
-                data,
-                lookupName
-            )
-
-        if id and isAssetId(tostring(id)) then
-            id = tostring(id)
-
-            IconLoader.loaded[requestedName] =
-                id
-
-            IconLoader.requested[requestedName] =
-                true
-
-            mergePackCache(
-                source.name,
-                {
-                    [actualName or lookupName] = id,
-                }
-            )
-
-            local updatedCache =
-                readPackCache(source.name)
-
-            if updatedCache then
-                IconLoader.sourceCache[source.name] =
-                    updatedCache
-            end
-
-            log(
-                "INFO",
-                "Icono '%s' encontrado en '%s'",
-                requestedName,
-                source.name
-            )
-
-            return id,
-                actualName or lookupName,
-                source.name
-        end
-    end
-
-    IconLoader.requested[requestedName] = true
-
-    IconLoader.errors[
-        "icon:" .. requestedName
-    ] = "NOT_FOUND"
-
-    log(
-        "WARN",
-        "Icono '%s' no encontrado",
-        requestedName
-    )
-
-    return nil
-end
-
-function IconLoader.Get(pack, name)
-    if type(pack) ~= "string"
-        or type(name) ~= "string" then
-        return nil
-    end
-
-    local source =
-        getSourceByName(pack)
-
-    if not source then
-        IconLoader.errors[pack] =
-            "NOT_FOUND"
-
-        return nil
-    end
-
-    return loadOne(
-        name,
-        { source }
-    )
-end
-
-function IconLoader.Find(name)
-    if type(name) ~= "string"
-        or name == "" then
-        return nil
-    end
-
-    if IconLoader.loaded[name] then
-        return IconLoader.loaded[name]
-    end
-
-    return loadOne(name)
-end
-
-function IconLoader.GetAny(list, name)
-    if type(list) ~= "table"
-        or type(name) ~= "string" then
-        return nil
-    end
-
-    local sources = {}
-
-    for _, pack in ipairs(list) do
-        local source =
-            getSourceByName(pack)
-
-        if source then
-            sources[#sources + 1] = source
-        end
-    end
-
-    if #sources == 0 then
-        return nil
-    end
-
-    return loadOne(name, sources)
-end
-
-function IconLoader.Load(names)
-    local result = {}
-
-    if type(names) == "string" then
-        names = { names }
-    end
-
-    if type(names) ~= "table" then
-        return result
-    end
-
-    for _, name in ipairs(names) do
-        if type(name) == "string"
-            and name ~= "" then
-
-            result[name] =
-                IconLoader.Find(name)
-        end
-    end
-
-    return result
-end
-
-function IconLoader.MakeIcon(name, size, parent)
-    size = tonumber(size) or 24
-
-    local image =
-        Instance.new("ImageLabel")
-
-    image.Name =
-        "Icon_" .. tostring(name)
-
-    image.Size =
-        UDim2.fromOffset(size, size)
-
-    image.BackgroundTransparency = 1
-
-    image.ScaleType =
-        Enum.ScaleType.Fit
-
-    image.Image =
-        IconLoader.Find(name) or ""
-
-    if parent then
-        image.Parent = parent
-    end
-
-    if image.Image == "" then
-        log(
-            "WARN",
-            "MakeIcon no pudo resolver '%s'",
-            tostring(name)
-        )
-    end
-
-    return image
-end
-
-function IconLoader.List()
-    local names = {}
-
-    for _, source in ipairs(SOURCES) do
-        names[#names + 1] =
-            source.name
-    end
-
-    table.sort(names)
-
-    return names
-end
-
-function IconLoader.Packs()
-    local result = {}
-
-    for _, source in ipairs(SOURCES) do
-        local cache =
-            readPackCache(source.name)
-
-        local count = 0
-
-        if cache
-            and type(cache.icons) == "table" then
-
-            for _ in pairs(cache.icons) do
-                count = count + 1
-            end
-        end
-
-        result[source.name] = {
-            type = source.type,
-            path = source.path,
-            loaded =
-                IconLoader.sourceData[
-                    source.name
-                ] ~= nil,
-
-            cached = cache ~= nil,
-            iconCount = count,
-
-            error =
-                IconLoader.errors[
-                    source.name
-                ],
-        }
-    end
-
-    return result
-end
-
-function IconLoader.Cache(pack)
-    if type(pack) ~= "string" then
-        return nil
-    end
-
-    local data =
-        readPackCache(pack)
-
-    if not data then
-        return nil
-    end
-
-    return {
-        version = data.version,
-        source = data.source,
-        timestamp = data.timestamp,
-        icons = data.icons,
-    }
-end
-
-function IconLoader.Search(query)
-    local result = {}
-
-    local normalizedQuery =
-        normalizeKey(query)
-
-    if normalizedQuery == "" then
-        return result
-    end
-
-    -- Buscar primero en fuentes que ya estan
-    -- cargadas en memoria.
-    for sourceName, data
-        in pairs(IconLoader.sourceData) do
-
-        if type(data) == "table" then
-            for name, id in pairs(data) do
-                if normalizeKey(name):find(
-                    normalizedQuery,
-                    1,
-                    true
-                ) then
-
-                    if isAssetId(tostring(id)) then
-                        result[#result + 1] = {
-                            pack = sourceName,
-                            name = name,
-                            id = tostring(id),
-                        }
-                    end
-                end
-            end
-        end
-    end
-
-    -- Buscar tambien en caches existentes.
-    for _, source in ipairs(SOURCES) do
-        local cache =
-            readPackCache(source.name)
-
-        if cache
-            and type(cache.icons) == "table" then
-
-            for name, id
-                in pairs(cache.icons) do
-
-                if normalizeKey(name):find(
-                    normalizedQuery,
-                    1,
-                    true
-                ) then
-
-                    if isAssetId(tostring(id)) then
-                        local duplicate = false
-
-                        for _, item
-                            in ipairs(result) do
-
-                            if item.pack == source.name
-                                and item.name == name then
-                                duplicate = true
-                                break
-                            end
-                        end
-
-                        if not duplicate then
-                            result[#result + 1] = {
-                                pack = source.name,
-                                name = name,
-                                id = tostring(id),
-                            }
-           aliases = {
-        home = "house",
-        terminal = "square-terminal",
-        gamepad = "gamepad-2",
-        logo = "bladex-hud-logo",
-    },
-    ready = false,
-    _waiters = {},
-}
-
-local function fileExists(path)
-    return type(isfile) == "function" and isfile(path)
-end
-
-local function dirExists(path)
-    return type(isfolder) == "function" and isfolder(path)
-end
-
-local function canWrite()
-    return type(writefile) == "function" and type(readfile) == "function"
-end
-
-local function ensureDir(dir)
-    if not canWrite() then
-        return false
-    end
-
-    if dirExists(dir) then
-        return true
-    end
-
-    local current = ""
-
-    for part in dir:gmatch("[^/]+") do
-        current = current == "" and part or current .. "/" .. part
-
-        if not dirExists(current) then
-            local ok = pcall(makefolder, current)
-            if not ok and not dirExists(current) then
-                return false
-            end
-        end
-    end
-
-    return dirExists(dir)
-end
-
-local function log(level, message, ...)
-    local text = message
-
-    if select("#", ...) > 0 then
-        local ok, formatted = pcall(string.format, message, ...)
-        if ok then
-            text = formatted
-        end
-    end
-
-    local line = "[IconLoader][" .. tostring(level) .. "] " .. tostring(text)
-
-    if level == "ERROR" or level == "WARN" then
-        if type(warn) == "function" then
-            warn(line)
-        elseif type(print) == "function" then
-            print(line)
-        end
-    elseif type(print) == "function" then
-        print(line)
-    end
-end
-
-local function normalizeKey(value)
-    local text = tostring(value or ""):lower()
-    text = text:gsub("[%s_%-]+", "")
-    return text
-end
-
-local function cacheKey(name)
-    return normalizeKey(name):gsub("[^%w]", "")
-end
-
-local function iconCachePath(name)
-    return CACHE_DIR .. "icon_" .. cacheKey(name) .. ".json"
-end
-
-local function readIconCache(name)
-    if not canWrite() then
-        return nil
-    end
-
-    local path = iconCachePath(name)
-
-    if not fileExists(path) then
-        return nil
-    end
-
-    local ok, raw = pcall(readfile, path)
-
-    if not ok or type(raw) ~= "string" or raw == "" then
-        return nil
-    end
-
-    local okJson, data = pcall(function()
-        return HttpService:JSONDecode(raw)
-    end)
-
-    if not okJson or type(data) ~= "table" then
-        return nil
-    end
-
-    local timestamp = tonumber(data.timestamp) or 0
-
-    if os.time() - timestamp > CACHE_TTL then
-        return nil
-    end
-
-    if type(data.name) ~= "string" or type(data.id) ~= "string" then
-        return nil
-    end
-
-    return {
-        name = data.name,
-        id = data.id,
-        source = data.source,
-        timestamp = timestamp,
-    }
-end
-
-local function writeIconCache(name, id, source)
-    if not canWrite() then
-        return false
-    end
-
-    if not ensureDir(CACHE_DIR) then
-        return false
-    end
-
-    local payload = {
-        timestamp = os.time(),
-        name = tostring(name),
-        id = tostring(id),
-        source = tostring(source or ""),
-    }
-
-    local ok = pcall(function()
-        writefile(iconCachePath(name), HttpService:JSONEncode(payload))
-    end)
-
-    return ok
-end
-
-local function removeIconCache(name)
-    if type(delfile) ~= "function" then
-        return false
-    end
-
-    local path = iconCachePath(name)
-
-    if not fileExists(path) then
-        return true
-    end
-
-    return pcall(delfile, path)
-end
-
-local function classifyError(value)
-    local text = tostring(value or ""):lower()
-
-    if text:find("404", 1, true) or text:find("not found", 1, true) then
-        return "NOT_FOUND"
-    end
-
-    if text:find("403", 1, true) or text:find("forbidden", 1, true) then
-        return "FORBIDDEN"
-    end
-
-    if text:find("429", 1, true) or text:find("rate limit", 1, true) then
-        return "RATE_LIMIT"
-    end
-
-    if text:find("timeout", 1, true) then
-        return "TIMEOUT"
-    end
-
-    if text == "" then
-        return "EMPTY"
-    end
-
-    return "UNKNOWN"
-end
-
-local function sourceUrl(source)
-    return BASE_URL .. source.path
-end
-
-local function decodeSource(raw, sourceName)
-    local ok, result = pcall(function()
-        local fn = loadstring(raw)
-
-        if type(fn) ~= "function" then
-            error("LOADSTRING_FAILED")
-        end
-
-        return fn()
-    end)
-
-    if not ok then
-        IconLoader.errors[sourceName] = classifyError(result)
-        log("ERROR", "Fuente '%s' invalida: %s", sourceName, IconLoader.errors[sourceName])
-        return nil
-    end
-
-    if type(result) ~= "table" then
-        IconLoader.errors[sourceName] = "INVALID_TABLE"
-        log("ERROR", "Fuente '%s' no devolvio una tabla", sourceName)
-        return nil
-    end
-
-    return result
-end
-
-local function fetchSource(source)
-    local sourceName = source.name
-
-    if IconLoader.sourceData[sourceName] then
-        return IconLoader.sourceData[sourceName]
-    end
-
-    if IconLoader.loading[sourceName] then
-        local elapsed = 0
-
-        while IconLoader.loading[sourceName] and elapsed < 10 do
-            task.wait(0.1)
-            elapsed = elapsed + 0.1
-        end
-
-        return IconLoader.sourceData[sourceName]
-    end
-
-    IconLoader.loading[sourceName] = true
-    IconLoader.errors[sourceName] = nil
-
-    local ok, raw = pcall(function()
-        return game:HttpGet(sourceUrl(source))
-    end)
-
-    if not ok or type(raw) ~= "string" or #raw < 5 then
-        IconLoader.errors[sourceName] = classifyError(raw)
-        IconLoader.loading[sourceName] = nil
-        return nil
-    end
-
-    local data = decodeSource(raw, sourceName)
-
-    IconLoader.loading[sourceName] = nil
-
-    if data then
-        IconLoader.sourceData[sourceName] = data
-        log("INFO", "Fuente '%s' cargada", sourceName)
-    end
-
-    return data
-end
-
-local function getSourceByName(name)
-    for _, source in ipairs(SOURCES) do
-        if source.name == name then
-            return source
-        end
-    end
-
-    return nil
-end
-
-local function findInData(data, name)
-    if type(data) ~= "table" then
-        return nil
-    end
-
-    local requested = tostring(name or "")
-    local normalized = normalizeKey(requested)
-
-    if data[requested] then
-        return data[requested], requested
-    end
-
-    if data[normalized] then
-        return data[normalized], normalized
-    end
-
-    for key, value in pairs(data) do
-        if normalizeKey(key) == normalized then
-            return value, key
-        end
-    end
-
-    return nil
-end
-
 local function resolveAlias(name)
-    local key = normalizeKey(name)
+    local normalized = normalizeKey(name)
 
-    for alias, target in pairs(IconLoader.aliases) do
-        if normalizeKey(alias) == key then
+    for alias, target in pairs(Loader.aliases) do
+        if normalizeKey(alias) == normalized then
             return target
         end
     end
@@ -1298,29 +517,32 @@ local function resolveAlias(name)
     return name
 end
 
-local function isAssetId(value)
-    return type(value) == "string"
-        and value:match("^rbxassetid://%d+$") ~= nil
-end
+-- LOAD
 
 local function loadOne(name, sourceList)
     if type(name) ~= "string" or name == "" then
         return nil
     end
 
-    local requestedName = name
-    local lookupName = resolveAlias(name)
-
-    local cached = readIconCache(requestedName)
-
-    if cached and isAssetId(cached.id) then
-        IconLoader.loaded[requestedName] = cached.id
-        IconLoader.requested[requestedName] = true
-        return cached.id
+    if Loader.loaded[name] then
+        return Loader.loaded[name]
     end
 
+    local lookupName = resolveAlias(name)
     local sources = sourceList or SOURCES
 
+    -- 1. Cache.
+    for _, source in ipairs(sources) do
+        local id = findInCache(source.name, lookupName)
+
+        if id then
+            Loader.loaded[name] = id
+            Loader.requested[name] = true
+            return id
+        end
+    end
+
+    -- 2. Fuentes remotas.
     for _, source in ipairs(sources) do
         local data = fetchSource(source)
         local id, actualName = findInData(data, lookupName)
@@ -1328,71 +550,32 @@ local function loadOne(name, sourceList)
         if id and isAssetId(tostring(id)) then
             id = tostring(id)
 
-            IconLoader.loaded[requestedName] = id
-            IconLoader.requested[requestedName] = true
+            Loader.loaded[name] = id
+            Loader.requested[name] = true
 
-            writeIconCache(requestedName, id, source.name)
+            mergePackCache(
+                source.name,
+                actualName or lookupName,
+                id
+            )
 
-            log("INFO", "Icono '%s' encontrado en '%s'", requestedName, source.name)
-
-            return id, actualName, source.name
+            return id
         end
     end
 
-    IconLoader.requested[requestedName] = true
-    IconLoader.errors["icon:" .. requestedName] = "NOT_FOUND"
-
-    log("WARN", "Icono '%s' no encontrado", requestedName)
+    Loader.requested[name] = true
+    Loader.errors["icon:" .. name] = "NOT_FOUND"
 
     return nil
 end
 
-function IconLoader.Get(pack, name)
-    if type(pack) ~= "string" or type(name) ~= "string" then
-        return nil
-    end
+-- PUBLIC API
 
-    local source = getSourceByName(pack)
-
-    if not source then
-        IconLoader.errors[pack] = "NOT_FOUND"
-        return nil
-    end
-
-    return loadOne(name, {source})
-end
-
-function IconLoader.Find(name)
-    if type(name) ~= "string" or name == "" then
-        return nil
-    end
-
-    if IconLoader.loaded[name] then
-        return IconLoader.loaded[name]
-    end
-
+function Loader.Find(name)
     return loadOne(name)
 end
 
-function IconLoader.GetAny(list, name)
-    if type(list) ~= "table" or type(name) ~= "string" then
-        return nil
-    end
-
-    local sources = {}
-
-    for _, pack in ipairs(list) do
-        local source = getSourceByName(pack)
-
-        if source then
-            sources[#sources + 1] = source
-        end
-    end
-
-    return loadOne(name, sources)
-end
-
-function IconLoader.Load(names)
+function Loader.Load(names)
     local result = {}
 
     if type(names) == "string" then
@@ -1405,75 +588,193 @@ function IconLoader.Load(names)
 
     for _, name in ipairs(names) do
         if type(name) == "string" and name ~= "" then
-            result[name] = IconLoader.Find(name)
+            -- pcall por icono: un error aislado no rompe todo Load().
+            local ok, id = pcall(loadOne, name)
+
+            if ok then
+                result[name] = id
+            else
+                result[name] = nil
+                Loader.errors["icon:" .. name] = "LOAD_ERROR"
+            end
         end
     end
 
     return result
 end
 
-function IconLoader.MakeIcon(name, size, parent)
-    size = tonumber(size) or 24
+function Loader.Get(pack, name)
+    local source = getSourceByName(pack)
 
-    local image = Instance.new("ImageLabel")
-    image.Name = "Icon_" .. tostring(name)
-    image.Size = UDim2.fromOffset(size, size)
-    image.BackgroundTransparency = 1
-    image.ScaleType = Enum.ScaleType.Fit
-    image.Image = IconLoader.Find(name) or ""
-
-    if parent then
-        image.Parent = parent
+    if not source or type(name) ~= "string" then
+        return nil
     end
 
-    if image.Image == "" then
-        log("WARN", "MakeIcon no pudo resolver '%s'", tostring(name))
-    end
-
-    return image
+    return loadOne(name, {source})
 end
 
-function IconLoader.List()
-    local names = {}
+function Loader.GetAny(packs, name)
+    if type(packs) ~= "table" or type(name) ~= "string" then
+        return nil
+    end
+
+    local sources = {}
+
+    for _, pack in ipairs(packs) do
+        local source = getSourceByName(pack)
+
+        if source then
+            sources[#sources + 1] = source
+        end
+    end
+
+    return loadOne(name, sources)
+end
+
+function Loader.MakeIcon(name, size, parent)
+    local ok, image = pcall(function()
+        local obj = Instance.new("ImageLabel")
+
+        obj.Name = "Icon_" .. tostring(name)
+        obj.Size = UDim2.fromOffset(tonumber(size) or 24, tonumber(size) or 24)
+        obj.BackgroundTransparency = 1
+        obj.ScaleType = Enum.ScaleType.Fit
+        obj.Image = Loader.Find(name) or ""
+
+        if parent then
+            obj.Parent = parent
+        end
+
+        return obj
+    end)
+
+    if ok then
+        return image
+    end
+
+    return nil
+end
+
+function Loader.Cache(pack)
+    if type(pack) ~= "string" then
+        return nil
+    end
+
+    return readPackCache(pack)
+end
+
+function Loader.Refresh(pack)
+    local source = getSourceByName(pack)
+
+    if not source then
+        return false
+    end
+
+    removePackCache(source.name)
+    Loader.sourceData[source.name] = nil
+    Loader.errors[source.name] = nil
+    Loader.loading[source.name] = nil
+
+    -- Solo invalida los iconos cargados desde esta operacion.
+    -- No borra caches de otros packs.
+    for name in pairs(Loader.loaded) do
+        Loader.loaded[name] = nil
+    end
+
+    return true
+end
+
+function Loader.RefreshIcon(name)
+    if type(name) ~= "string" or name == "" then
+        return false
+    end
+
+    local target = normalizeKey(resolveAlias(name))
 
     for _, source in ipairs(SOURCES) do
-        names[#names + 1] = source.name
+        local cache = readPackCache(source.name)
+
+        if cache and type(cache.icons) == "table" then
+            local changed = false
+
+            for iconName in pairs(cache.icons) do
+                if normalizeKey(iconName) == target then
+                    cache.icons[iconName] = nil
+                    changed = true
+                end
+            end
+
+            if changed then
+                writePackCache(source.name, cache.icons)
+            end
+        end
     end
 
-    table.sort(names)
+    Loader.loaded[name] = nil
+    Loader.requested[name] = nil
+    Loader.errors["icon:" .. name] = nil
 
-    return names
+    local ok, id = pcall(Loader.Find, name)
+    return ok and id ~= nil
 end
 
-function IconLoader.Packs()
+function Loader.Packs()
     local result = {}
 
     for _, source in ipairs(SOURCES) do
+        local cache = readPackCache(source.name)
+        local count = 0
+
+        if cache and type(cache.icons) == "table" then
+            for _ in pairs(cache.icons) do
+                count = count + 1
+            end
+        end
+
         result[source.name] = {
-            type = source.type,
             path = source.path,
-            loaded = IconLoader.sourceData[source.name] ~= nil,
-            error = IconLoader.errors[source.name],
+            type = source.type,
+            cached = cache ~= nil,
+            iconCount = count,
+            loaded = Loader.sourceData[source.name] ~= nil,
+            filesystem = fsAvailable(),
         }
     end
 
     return result
 end
 
-function IconLoader.Search(query)
+function Loader.List()
     local result = {}
-    local normalizedQuery = normalizeKey(query)
 
-    if normalizedQuery == "" then
+    for _, source in ipairs(SOURCES) do
+        result[#result + 1] = source.name
+    end
+
+    table.sort(result)
+    return result
+end
+
+function Loader.Search(query)
+    local result = {}
+    local normalized = normalizeKey(query)
+
+    if normalized == "" then
         return result
     end
 
-    for sourceName, data in pairs(IconLoader.sourceData) do
-        for name, id in pairs(data) do
-            if normalizeKey(name):find(normalizedQuery, 1, true) then
-                if isAssetId(tostring(id)) then
+    -- Busca primero en cache; nunca obliga a descargar todos los packs.
+    for _, source in ipairs(SOURCES) do
+        local cache = readPackCache(source.name)
+
+        if cache and type(cache.icons) == "table" then
+            for name, id in pairs(cache.icons) do
+                if type(name) == "string"
+                    and isAssetId(tostring(id))
+                    and normalizeKey(name):find(normalized, 1, true) then
+
                     result[#result + 1] = {
-                        pack = sourceName,
+                        pack = source.name,
                         name = name,
                         id = tostring(id),
                     }
@@ -1485,163 +786,117 @@ function IconLoader.Search(query)
     return result
 end
 
-function IconLoader.Ready(timeout)
-    timeout = tonumber(timeout) or 15
-
-    local started = os.clock()
-
-    while os.clock() - started < timeout do
-        if not IconLoader.ready then
-            local source = SOURCES[1]
-            fetchSource(source)
-            IconLoader.ready = true
-
-            for _, callback in ipairs(IconLoader._waiters) do
-                pcall(callback)
-            end
-
-            IconLoader._waiters = {}
-        end
-
-        return true
-    end
-
-    return IconLoader.ready
-end
-
-function IconLoader.Refresh(pack)
-    if type(pack) ~= "string" then
-        return false
-    end
-
-    local source = getSourceByName(pack)
-
-    if not source then
-        return false
-    end
-
-    IconLoader.sourceData[pack] = nil
-    IconLoader.errors[pack] = nil
-
-    for name in pairs(IconLoader.loaded) do
-        local cached = readIconCache(name)
-
-        if cached and cached.source == pack then
-            IconLoader.loaded[name] = nil
-            removeIconCache(name)
-        end
-    end
-
-    return fetchSource(source) ~= nil
-end
-
-function IconLoader.RefreshIcon(name)
-    if type(name) ~= "string" then
-        return false
-    end
-
-    IconLoader.loaded[name] = nil
-    IconLoader.requested[name] = nil
-    IconLoader.errors["icon:" .. name] = nil
-
-    removeIconCache(name)
-
-    return IconLoader.Find(name) ~= nil
-end
-
-function IconLoader.Errors()
+function Loader.Errors()
     local result = {}
 
-    for key, value in pairs(IconLoader.errors) do
+    for key, value in pairs(Loader.errors) do
         result[key] = value
     end
 
     return result
 end
 
-function IconLoader.OnReady(callback)
+function Loader.OnReady(callback)
     if type(callback) ~= "function" then
         return false
     end
 
-    if IconLoader.ready then
-        task.spawn(function()
-            pcall(callback)
+    if Loader.ready then
+        pcall(function()
+            if type(task) == "table" and type(task.spawn) == "function" then
+                task.spawn(callback)
+            else
+                callback()
+            end
         end)
-    else
-        IconLoader._waiters[#IconLoader._waiters + 1] = callback
+
+        return true
     end
 
+    Loader._waiters[#Loader._waiters + 1] = callback
     return true
 end
 
-function IconLoader.Help()
-    return ([[
-IconLoader v%s
+function Loader.Ready()
+    if Loader.ready then
+        return true
+    end
 
-USO:
-local icons = IL.Load({"settings", "house", "square-terminal"})
+    Loader.ready = true
 
-FUNCIONES:
-Load(names)
-Find(name)
-Get(pack, name)
-GetAny({packs}, name)
-MakeIcon(name, size, parent)
-Search(query)
-List()
-Packs()
-Ready(timeout)
-Refresh(pack)
-RefreshIcon(name)
-Errors()
-Spec()
-Help()
+    for _, callback in ipairs(Loader._waiters) do
+        pcall(function()
+            if type(task) == "table" and type(task.spawn) == "function" then
+                task.spawn(callback)
+            else
+                callback()
+            end
+        end)
+    end
 
-No usa PNG, SVG, emojis, glifos ni placeholders.
-Los iconos deben existir en una fuente del repositorio.
-]]):format(IconLoader.version)
+    Loader._waiters = {}
+    return true
 end
 
-function IconLoader.Spec()
+function Loader.Spec()
     local sources = {}
 
     for _, source in ipairs(SOURCES) do
         sources[source.name] = {
             path = source.path,
             type = source.type,
+            cache = cachePath(source.name),
         }
     end
 
     return {
         name = "IconLoader",
-        version = IconLoader.version,
-        baseUrl = BASE_URL,
-        cacheDir = CACHE_DIR,
-        cacheMode = "individual-icons",
+        version = Loader.version,
+        cacheMode = "per-pack",
+        cachePolicy = "requested-icons-only",
+        filesystem = fsAvailable(),
         sources = sources,
-        aliases = IconLoader.aliases,
-        functions = {
-            Load = {params = {"names: table|string"}, returns = "table"},
-            Find = {params = {"name: string"}, returns = "string|nil"},
-            Get = {params = {"pack: string", "name: string"}, returns = "string|nil"},
-            GetAny = {params = {"packs: table", "name: string"}, returns = "string|nil"},
-            MakeIcon = {params = {"name: string", "size?: number", "parent?: Instance"}, returns = "ImageLabel"},
-            Search = {params = {"query: string"}, returns = "table"},
-            List = {params = {}, returns = "table"},
-            Packs = {params = {}, returns = "table"},
-            Ready = {params = {"timeout?: number"}, returns = "boolean"},
-            Refresh = {params = {"pack: string"}, returns = "boolean"},
-            RefreshIcon = {params = {"name: string"}, returns = "boolean"},
-            Errors = {params = {}, returns = "table"},
-            Spec = {params = {}, returns = "table"},
-            Help = {params = {}, returns = "string"},
-        },
+        aliases = Loader.aliases,
     }
 end
 
-IconLoader.Ready(10)
+function Loader.Help()
+    return ([[IconLoader v%s
 
-log("INFO", "IconLoader v%s inicializado", IconLoader.version)
+Cache:
+  Bladex/assets/<pack>.json
 
-return IconLoader
+Ejemplo:
+  Bladex/assets/lucide.json
+
+El filesystem es opcional.
+Si no existe readfile/writefile/isfile, se usa memoria.
+
+Funciones:
+  Load(names)
+  Find(name)
+  Get(pack, name)
+  GetAny(packs, name)
+  MakeIcon(name, size, parent)
+  Cache(pack)
+  Refresh(pack)
+  RefreshIcon(name)
+  Search(query)
+  List()
+  Packs()
+  Errors()
+  Spec()
+  Help()
+]]):format(Loader.version)
+end
+
+Loader.Ready()
+
+log(
+    "INFO",
+    "IconLoader v%s iniciado | cache por pack | filesystem=%s",
+    Loader.version,
+    tostring(fsAvailable())
+)
+
+return Loader
