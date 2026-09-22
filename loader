@@ -19,7 +19,9 @@
     local icon = Loader.MakeIcon("home", 24, btn)
     icon.Position = UDim2.new(0.5, -12, 0.5, -12)
 
-    Iconos conocidos del pack "bladex": "home", "settings", "logo", "gamepad", "terminal".
+    IMPORTANTE: El pack "bladex" tiene prioridad máxima y se carga primero.
+    Iconos confirmados en "bladex": "home", "settings", "logo", "gamepad", "terminal".
+    Si el icono no está en "bladex", el loader buscará en los demás packs automáticamente.
 ]]
 
 -- Bladex Icon Loader v1.0.0
@@ -27,16 +29,19 @@
 
 local HttpService = game:GetService("HttpService")
 
--- URL base del repositorio de iconos
+-- URL base para rutas relativas
 local BASE_URL = "https://raw.githubusercontent.com/BladexDevX/Icons/refs/heads/main/"
 -- Carpeta donde se guardará la caché local
 local CACHE_DIR = "Bladex/assets/"
 local CACHE_TTL = 86400
 local HTTP_TIMEOUT = 10
 
--- Lista de packs disponibles y sus rutas
+-- Lista de packs disponibles (El primero tiene prioridad)
 local SOURCES = {
-    {name = "bladex", path = "Icons%20bladex.lua", type = "icon"},
+    -- URL ABSOLUTA CON PRIORIDAD MÁXIMA
+    {name = "bladex", path = "https://raw.githubusercontent.com/BladexDevX/loader/refs/heads/main/Icons%20bladex.lua", type = "icon"},
+    
+    -- Rutas relativas (se les añadirá BASE_URL automáticamente)
     {name = "lucide", path = "Iconos/lucide.lua", type = "icon"},
     {name = "solar", path = "Iconos/solar.lua", type = "icon"},
     {name = "gravity", path = "Iconos/gravity.lua", type = "icon"},
@@ -344,7 +349,13 @@ local function fetchSource(source)
     Loader.loading[sourceName] = true
     Loader.errors[sourceName] = nil
 
-    local raw, reason = httpGet(BASE_URL .. source.path)
+    -- Detecta si la ruta ya es una URL completa, si no, le añade la BASE_URL.
+    local targetUrl = source.path
+    if type(targetUrl) ~= "string" or not targetUrl:match("^https?://") then
+        targetUrl = BASE_URL .. tostring(targetUrl)
+    end
+
+    local raw, reason = httpGet(targetUrl)
     if not raw then
         Loader.errors[sourceName] = reason or "HTTP_FAILED"
         Loader.loading[sourceName] = nil
